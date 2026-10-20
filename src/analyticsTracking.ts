@@ -5,7 +5,7 @@
  * Strictly opt-in (enabled: false by default).
  */
 
-import { createHash } from "crypto";
+import { createHash, randomBytes } from "crypto";
 
 export type PrivacyLevel = "strict" | "anonymized" | "standard";
 
@@ -82,6 +82,195 @@ export interface AnalyticsTrackerOptions {
   onReport?: (report: AnalyticsReport) => void;
   /** Optional custom fetch implementation for network reporting. */
   fetchFn?: typeof fetch;
+  /** Distributed tracing configuration. */
+  tracing?: TracingConfig;
+}
+
+// ---------------------------------------------------------------------------
+// Distributed Tracing
+// ---------------------------------------------------------------------------
+
+/**
+ * W3C Trace Context compatible identifiers. A trace is a tree of spans sharing
+ * the same traceId; each span has its own spanId and an optional parentSpanId.
+ */
+export interface TraceContext {
+  traceId: string;
+  spanId: string;
+  parentSpanId?: string;
+  sampled: boolean;
+}
+
+export interface Span {
+  traceId: string;
+  spanId: string;
+  parentSpanId?: string;
+  name: string;
+  startTime: number;
+  endTime?: number;
+  durationMs?: number;
+  attributes: Record<string, unknown>;
+  status: "ok" | "error";
+  error?: string;
+}
+
+export interface TracingConfig {
+  /** Enable tracing. Default: false (opt-in, consistent with analytics). */
+  enabled?: boolean;
+  /** Sampling ratio in [0, 1]. Default: 1 (sample everything). */
+  sampleRate?: number;
+  /** Service name attached to exported spans. */
+  serviceName?: string;
+  /** Maximum number of finished spans retained before export. Default: 1000. */
+  maxSpans?: number;
+  /** Custom span exporter invoked on flush. */
+  exporter?: (spans: Span[]) => void;
+}
+
+const TRACEPARENT_PATTERN = /^([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{16})-([0-9a-f]{2})$/;
+
+function randomHex(bytes: number): string {
+  return randomBytes(bytes).toString("hex");
+}
+
+/**
+ * Lightweight W3C Trace Context implementation: sampling, span creation,
+ * propagation via the `traceparent` header, and buffered export.
+ */
+export class Tracer {
+  private readonly enabled: boolean;
+  private readonly sampleRate: number;
+  private readonly serviceName: string;
+  private readonly maxSpans: number;
+  private readonly exporter?: (spans: Span[]) => void;
+  private readonly spans: Span[] = [];
+
+  constructor(config?: TracingConfig) {
+    this.enabled = config?.enabled ?? false;
+    this.sampleRate = Math.min(1, Math.max(0, config?.sampleRate ?? 1));
+    this.serviceName = config?.serviceName ?? "stellar-sdk";
+    this.maxSpans = config?.maxSpans ?? 1000;
+    this.exporter = config?.exporter;
+  }
+
+  get isEnabled(): boolean {
+    return this.enabled;
+  }
+
+  /** Decide whether a new trace should be sampled. */
+  shouldSample(): boolean {
+    if (!this.enabled) return false;
+    if (this.sampleRate >= 1) return true;
+    if (this.sampleRate <= 0) return false;
+    return Math.random() < this.sampleRate;
+  }
+
+  /** Start a new root trace context. */
+  startTrace(): TraceContext {
+    return {
+      traceId: randomHex(16),
+      spanId: randomHex(8),
+      sampled: this.shouldSample(),
+    };
+  }
+
+  /** Parse an incoming `traceparent` header into a TraceContext. */
+  extractTraceContext(headers: Record<string, string | undefined>): TraceContext | undefined {
+    const raw = headers["traceparent"] ?? headers["Traceparent"];
+    if (!raw) return undefined;
+    const match = TRACEPARENT_PATTERN.exec(raw.trim().toLowerCase());
+    if (!match) return undefined;
+    const [, traceId, parentSpanId, , flags] = match;
+    if (traceId === "0".repeat(32) || parentSpanId === "0".repeat(16)) return undefined;
+    return {
+      traceId,
+      spanId: randomHex(8),
+      parentSpanId,
+      sampled: (parseInt(flags, 16) & 0x01) === 0x01,
+    };
+  }
+
+  /** Serialize a TraceContext into a `traceparent` header value. */
+  injectTraceContext(context: TraceContext): Record<string, string> {
+    const flags = context.sampled ? "01" : "00";
+    return {
+      traceparent: `${context.traceId}-${context.spanId}-${flags}`,
+    };
+  }
+
+  /** Create a child span context from a parent context. */
+  childContext(parent: TraceContext): TraceContext {
+    return {
+      traceId: parent.traceId,
+      spanId: randomHex(8),
+      parentSpanId: parent.spanId,
+      sampled: parent.sampled,
+    };
+  }
+
+  /** Begin a span for a tracked operation. */
+  startSpan(name: string, context?: TraceContext, attributes?: Record<string, unknown>): Span {
+    const ctx = context ?? this.startTrace();
+    return {
+      traceId: ctx.traceId,
+      spanId: ctx.spanId,
+      parentSpanId: ctx.parentSpanId,
+      name,
+      startTime: Date.now(),
+      attributes: { "service.name": this.serviceName, ...(attributes ?? {}) },
+      status: "ok",
+    };
+  }
+
+  /** Finish a span, recording duration/status and buffering it for export. */
+  endSpan(span: Span, error?: unknown): Span {
+    span.endTime = Date.now();
+    span.durationMs = span.endTime - span.startTime;
+    if (error !== undefined) {
+      span.status = "error";
+      span.error = error instanceof Error ? error.message : String(error);
+    }
+    if (span.traceId && this.enabled) {
+      if (this.spans.length >= this.maxSpans) {
+        this.spans.shift();
+      }
+      this.spans.push(span);
+    }
+    return span;
+  }
+
+  /** Convenience wrapper: run fn inside a span, ending it on completion. */
+  async withSpan<T>(
+    name: string,
+    fn: (context: TraceContext) => Promise<T> | T,
+    context?: TraceContext,
+    attributes?: Record<string, unknown>,
+  ): Promise<T> {
+    const ctx = context ?? this.startTrace();
+    const span = this.startSpan(name, ctx, attributes);
+    try {
+      const result = await fn(ctx);
+      this.endSpan(span);
+      return result;
+    } catch (err) {
+      this.endSpan(span, err);
+      throw err;
+    }
+  }
+
+  /** Export buffered spans via the configured exporter and clear the buffer. */
+  flush(): Span[] {
+    const batch = this.spans.splice(0, this.spans.length);
+    if (batch.length > 0 && this.exporter) {
+      this.exporter(batch);
+    }
+    return batch;
+  }
+
+  /** Return a copy of currently buffered spans (for visualization). */
+  getSpans(): Span[] {
+    return [...this.spans];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -263,286 +452,49 @@ export class AnalyticsCollector {
 
   private calculatePercentile(sorted: number[], p: number): number {
     if (sorted.length === 0) return 0;
-    const index = Math.ceil((p / 100) * sorted.length) - 1;
-    return sorted[Math.max(0, Math.min(index, sorted.length - 1))] ?? 0;
+    const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+    return sorted[idx];
   }
 
-  generateReport(privacyLevel: PrivacyLevel = "anonymized"): AnalyticsReport {
+  generateReport(privacy: PrivacyController): AnalyticsReport {
     const now = Date.now();
-    const methodsReport: Record<string, MethodMetric> = {};
-
+    const methods: Record<string, MethodMetric> = {};
     let totalMethodCalls = 0;
     let totalErrors = 0;
 
-    for (const [method, rec] of this.methods.entries()) {
+    for (const [name, rec] of this.methods.entries()) {
       const sorted = [...rec.durations].sort((a, b) => a - b);
       const sum = sorted.reduce((acc, d) => acc + d, 0);
-      const avg = sorted.length > 0 ? Number((sum / sorted.length).toFixed(2)) : 0;
-      const min = sorted.length > 0 ? (sorted[0] ?? 0) : 0;
-      const max = sorted.length > 0 ? (sorted[sorted.length - 1] ?? 0) : 0;
-      const errorRate = rec.count > 0 ? Number((rec.errors / rec.count).toFixed(4)) : 0;
-
-      totalMethodCalls += rec.count;
-      totalErrors += rec.errors;
-
-      methodsReport[method] = {
+      methods[name] = {
         calls: rec.count,
         errors: rec.errors,
-        errorRate,
-        avgDurationMs: avg,
-        minDurationMs: min,
-        maxDurationMs: max,
+        errorRate: rec.count > 0 ? rec.errors / rec.count : 0,
+        avgDurationMs: sorted.length > 0 ? sum / sorted.length : 0,
+        minDurationMs: sorted.length > 0 ? sorted[0] : 0,
+        maxDurationMs: sorted.length > 0 ? sorted[sorted.length - 1] : 0,
         p50DurationMs: this.calculatePercentile(sorted, 50),
         p95DurationMs: this.calculatePercentile(sorted, 95),
         p99DurationMs: this.calculatePercentile(sorted, 99),
       };
+      totalMethodCalls += rec.count;
+      totalErrors += rec.errors;
     }
-
-    const overallErrorRate =
-      totalMethodCalls > 0 ? Number((totalErrors / totalMethodCalls).toFixed(4)) : 0;
 
     return {
       generatedAt: now,
       periodMs: now - this.startTime,
-      privacyLevel,
+      privacyLevel: privacy.level,
       totalEvents: this.events.length,
       totalMethodCalls,
       totalErrors,
-      overallErrorRate,
-      methods: methodsReport,
+      overallErrorRate: totalMethodCalls > 0 ? totalErrors / totalMethodCalls : 0,
+      methods,
       eventsByCategory: Object.fromEntries(this.categoryCounts.entries()),
-      metrics: Object.fromEntries(this.metrics.entries()),
-      events: [...this.events],
+      metrics: this.getMetrics(),
+      events: this.events.map((e) => ({
+        ...e,
+        properties: privacy.sanitizeProperties(e.properties),
+      })),
     };
   }
-
-  reset(): void {
-    this.events.length = 0;
-    this.methods.clear();
-    this.metrics.clear();
-    this.categoryCounts.clear();
-    this.startTime = Date.now();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Main Analytics Tracker API
-// ---------------------------------------------------------------------------
-
-export class AnalyticsTracker {
-  private _enabled: boolean;
-  private readonly privacy: PrivacyController;
-  private readonly collector: AnalyticsCollector;
-  private readonly endpoint?: string;
-  private readonly onReport?: (report: AnalyticsReport) => void;
-  private readonly fetchFn: typeof fetch;
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
-
-  constructor(options: AnalyticsTrackerOptions = {}) {
-    this.privacy = new PrivacyController(options.privacy);
-    // Respect Do Not Track
-    if (this.privacy.isDoNotTrackEnabled()) {
-      this._enabled = false;
-    } else {
-      this._enabled = options.enabled ?? false;
-    }
-
-    this.collector = new AnalyticsCollector(options.maxQueueSize ?? 1000);
-    this.endpoint = options.endpoint;
-    this.onReport = options.onReport;
-    this.fetchFn = options.fetchFn ?? (typeof fetch !== "undefined" ? fetch : (() => Promise.resolve({ ok: true })) as unknown as typeof fetch);
-
-    if (this._enabled && options.flushIntervalMs && options.flushIntervalMs > 0) {
-      this.flushTimer = setInterval(() => void this.flush(), options.flushIntervalMs);
-      if (typeof this.flushTimer === "object" && this.flushTimer !== null && "unref" in this.flushTimer) {
-        (this.flushTimer as NodeJS.Timeout).unref();
-      }
-    }
-  }
-
-  isEnabled(): boolean {
-    return this._enabled && !this.privacy.isDoNotTrackEnabled();
-  }
-
-  optIn(): void {
-    if (!this.privacy.isDoNotTrackEnabled()) {
-      this._enabled = true;
-    }
-  }
-
-  optOut(): void {
-    this._enabled = false;
-    this.collector.reset();
-  }
-
-  getPrivacyLevel(): PrivacyLevel {
-    return this.privacy.level;
-  }
-
-  /**
-   * Track an arbitrary SDK event with privacy scrubbing applied.
-   */
-  track(event: AnalyticsEventInput): void {
-    if (!this.isEnabled()) return;
-
-    const sanitizedProps = this.privacy.sanitizeProperties(event.properties);
-    const sanitizedEvent: AnalyticsEvent = {
-      name: this.privacy.sanitizeString(event.name),
-      category: event.category || "general",
-      properties: sanitizedProps,
-      timestamp: event.timestamp ?? Date.now(),
-    };
-
-    this.collector.recordEvent(sanitizedEvent);
-  }
-
-  /**
-   * Track method execution latency, success/failure status, and metadata.
-   */
-  trackMethod(
-    method: string,
-    durationMs: number,
-    success: boolean,
-    metadata?: Record<string, unknown>,
-  ): void {
-    if (!this.isEnabled()) return;
-
-    this.collector.recordMethod(method, Math.max(0, durationMs), success);
-    this.track({
-      name: `method:${method}`,
-      category: "method_call",
-      properties: {
-        method,
-        durationMs,
-        success,
-        ...metadata,
-      },
-    });
-  }
-
-  /**
-   * Track an error encountered during SDK operation.
-   */
-  trackError(error: Error | string, context?: Record<string, unknown>): void {
-    if (!this.isEnabled()) return;
-
-    const message = typeof error === "string" ? error : error.message;
-    const name = typeof error === "string" ? "Error" : error.name;
-
-    this.track({
-      name: "error_occurred",
-      category: "errors",
-      properties: {
-        errorName: name,
-        errorMessage: message,
-        ...context,
-      },
-    });
-    this.collector.recordMetric("error_count", 1);
-  }
-
-  /**
-   * Track a numerical metric counter or gauge.
-   */
-  trackMetric(name: string, value: number): void {
-    if (!this.isEnabled()) return;
-    this.collector.recordMetric(name, value);
-  }
-
-  /**
-   * Generate a comprehensive analytics report of all metrics accumulated.
-   */
-  generateReport(): AnalyticsReport {
-    const report = this.collector.generateReport(this.privacy.level);
-    if (this.onReport) {
-      try {
-        this.onReport(report);
-      } catch {
-        // Non-blocking report callback
-      }
-    }
-    return report;
-  }
-
-  /**
-   * Dispatch report to configured remote endpoint, notify onReport, and reset counters.
-   */
-  async flush(): Promise<AnalyticsReport | null> {
-    if (!this.isEnabled()) return null;
-
-    const report = this.generateReport();
-    this.collector.reset();
-
-    if (this.endpoint) {
-      try {
-        await this.fetchFn(this.endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(report),
-        });
-      } catch {
-        // Analytics flush failure must never break consumer operations
-      }
-    }
-
-    return report;
-  }
-
-  /**
-   * Cleanup timer resources and reset collector.
-   */
-  destroy(): void {
-    if (this.flushTimer !== null) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-    this.collector.reset();
-  }
-}
-
-/**
- * Convenience helper to wrap any client or service with automated analytics tracking.
- */
-export function wrapClientWithAnalytics<T extends object>(
-  client: T,
-  tracker: AnalyticsTracker,
-): T {
-  if (!tracker.isEnabled()) {
-    return client;
-  }
-
-  return new Proxy(client, {
-    get(target, prop, receiver) {
-      const orig = Reflect.get(target, prop, receiver);
-      if (typeof orig === "function" && typeof prop === "string") {
-        return function (this: unknown, ...args: unknown[]) {
-          const start = Date.now();
-          try {
-            const result = (orig as (...a: unknown[]) => unknown).apply(this ?? target, args);
-            if (result && typeof result === "object" && "then" in result && typeof (result as Promise<unknown>).then === "function") {
-              return (result as Promise<unknown>)
-                .then((res) => {
-                  tracker.trackMethod(prop, Date.now() - start, true);
-                  return res;
-                })
-                .catch((err) => {
-                  tracker.trackMethod(prop, Date.now() - start, false, {
-                    errorMessage: (err as Error)?.message,
-                  });
-                  throw err;
-                });
-            }
-            tracker.trackMethod(prop, Date.now() - start, true);
-            return result;
-          } catch (err) {
-            tracker.trackMethod(prop, Date.now() - start, false, {
-              errorMessage: (err as Error)?.message,
-            });
-            throw err;
-          }
-        };
-      }
-      return orig;
-    },
-  });
 }
