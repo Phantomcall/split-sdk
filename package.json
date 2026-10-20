@@ -43,6 +43,11 @@
       "types": "./dist/telemetryModule.d.ts",
       "import": "./dist/telemetryModule.js",
       "require": "./dist/telemetryModule.cjs"
+    },
+    "./logging": {
+      "types": "./dist/logging/index.d.ts",
+      "import": "./dist/logging/index.js",
+      "require": "./dist/logging/index.cjs"
     }
   },
   "files": [
