@@ -188,208 +188,343 @@ export function calculatePoolShare(
 }
 
 // ---------------------------------------------------------------------------
-// Price oracle integration helpers
+// Liquidity provider support (deposit / withdraw)
 // ---------------------------------------------------------------------------
 
 /**
- * A single price observation returned by a price oracle source.
+ * Result of a proportional liquidity deposit calculation.
  */
-export interface OraclePriceObservation {
-  /** Asset identifier the price refers to (e.g. "native" or "USDC:GA..."). */
-  asset: string;
-  /** Price expressed as a decimal string, in the oracle's quote asset. */
-  price: string;
-  /** Unix timestamp (seconds) at which the price was observed. */
-  timestamp: number;
+export interface DepositEstimate {
+  /** Amount of asset A to deposit, in stroops. */
+  amountA: string;
+  /** Amount of asset B to deposit, in stroops. */
+  amountB: string;
+  /** Pool shares that would be minted, in stroops. */
+  sharesMinted: string;
+  assetA: string;
+  assetB: string;
 }
 
 /**
- * A price oracle source that can be queried for the latest price of an asset.
- * Implementations may wrap an on-chain oracle contract, an HTTP feed, or a
- * cached in-memory source.
+ * Result of a proportional liquidity withdrawal calculation.
  */
-export interface PriceOracleSource {
-  /** Fetches the latest observation for the given asset. */
-  getPrice(asset: string): Promise<OraclePriceObservation>;
+export interface WithdrawEstimate {
+  /** Amount of asset A returned, in stroops. */
+  amountA: string;
+  /** Amount of asset B returned, in stroops. */
+  amountB: string;
+  /** Pool shares burned, in stroops. */
+  sharesBurned: string;
+  assetA: string;
+  assetB: string;
 }
 
 /**
- * A parsed, validated oracle price ready for use in AMM calculations.
- */
-export interface ParsedOraclePrice {
-  asset: string;
-  /** Price as a decimal string, normalized to a fixed precision. */
-  price: string;
-  /** Price scaled to an integer string (price * 10^decimals). */
-  scaledPrice: string;
-  /** Number of decimal places used for scaledPrice. */
-  decimals: number;
-  timestamp: number;
-  /** Age of the observation in seconds relative to the provided `now`. */
-  ageSeconds: number;
-  /** Whether the observation is older than the staleness threshold. */
-  stale: boolean;
-}
-
-/**
- * Options controlling how oracle prices are parsed and validated.
- */
-export interface OraclePriceOptions {
-  /** Decimal places used when scaling the price. Defaults to 7 (Stellar). */
-  decimals?: number;
-  /** Maximum acceptable age in seconds before a price is flagged stale. */
-  maxAgeSeconds?: number;
-  /** Reference time (unix seconds) used to compute age. Defaults to now. */
-  now?: number;
-}
-
-const DEFAULT_ORACLE_DECIMALS = 7;
-const DEFAULT_ORACLE_MAX_AGE_SECONDS = 300;
-
-/**
- * Fetches the latest price for `asset` from the given oracle source and parses
- * it into a validated {@link ParsedOraclePrice}.
+ * Computes the amounts of both assets required to mint `sharesToMint` pool
+ * shares, based on the current pool reserves and total shares outstanding.
  *
- * @param source  - The oracle source to query.
- * @param asset   - The asset identifier to fetch a price for.
- * @param options - Parsing/validation options.
- * @throws Error when the source returns a malformed or non-positive price.
+ * @param pool         - The liquidity pool record.
+ * @param sharesToMint - Desired number of pool shares to mint, in stroops.
+ * @returns A DepositEstimate with the required deposit amounts.
  */
-export async function fetchOraclePrice(
-  source: PriceOracleSource,
-  asset: string,
-  options: OraclePriceOptions = {}
-): Promise<ParsedOraclePrice> {
-  const observation = await source.getPrice(asset);
-  return parseOraclePrice(observation, options);
-}
-
-/**
- * Parses and validates a raw {@link OraclePriceObservation} into a
- * {@link ParsedOraclePrice}, scaling the price to an integer string and
- * computing staleness relative to `options.now`.
- *
- * @param observation - The raw observation to parse.
- * @param options     - Parsing/validation options.
- * @throws Error when the price is missing, malformed, or non-positive.
- */
-export function parseOraclePrice(
-  observation: OraclePriceObservation,
-  options: OraclePriceOptions = {}
-): ParsedOraclePrice {
-  const decimals = options.decimals ?? DEFAULT_ORACLE_DECIMALS;
-  const maxAgeSeconds =
-    options.maxAgeSeconds ?? DEFAULT_ORACLE_MAX_AGE_SECONDS;
-  const now = options.now ?? Math.floor(Date.now() / 1000);
-
-  if (!observation || typeof observation.price !== "string") {
-    throw new Error("Oracle price observation is missing a price");
+export function calculateDeposit(
+  pool: { reserves: { asset: string; amount: string }[]; totalShares: string },
+  sharesToMint: string
+): DepositEstimate {
+  if (pool.reserves.length < 2) {
+    throw new InsufficientLiquidityError(
+      "Pool must have at least two reserve assets",
+      "0",
+      sharesToMint
+    );
   }
 
-  const price = observation.price.trim();
-  if (!/^\d+(\.\d+)?$/.test(price)) {
-    throw new Error(`Malformed oracle price: ${observation.price}`);
+  const totalShares = BigInt(pool.totalShares);
+  const mint = BigInt(sharesToMint);
+
+  if (totalShares <= 0n) {
+    throw new InsufficientLiquidityError(
+      "Pool has zero total shares",
+      "0",
+      sharesToMint
+    );
   }
 
-  const scaledPrice = scaleDecimal(price, decimals);
-  if (BigInt(scaledPrice) <= 0n) {
-    throw new Error(`Oracle price must be positive: ${observation.price}`);
+  const reserve0 = pool.reserves[0]!;
+  const reserve1 = pool.reserves[1]!;
+  const reserveA = BigInt(reserve0.amount);
+  const reserveB = BigInt(reserve1.amount);
+
+  if (mint <= 0n) {
+    return {
+      amountA: "0",
+      amountB: "0",
+      sharesMinted: "0",
+      assetA: reserve0.asset,
+      assetB: reserve1.asset,
+    };
   }
 
-  const ageSeconds = Math.max(0, now - observation.timestamp);
+  // Required deposit: (mint / totalShares) * reserve
+  const amountA = (reserveA * mint) / totalShares;
+  const amountB = (reserveB * mint) / totalShares;
 
   return {
-    asset: observation.asset,
-    price,
-    scaledPrice,
-    decimals,
-    timestamp: observation.timestamp,
-    ageSeconds,
-    stale: ageSeconds > maxAgeSeconds,
+    amountA: amountA.toString(),
+    amountB: amountB.toString(),
+    sharesMinted: mint.toString(),
+    assetA: reserve0.asset,
+    assetB: reserve1.asset,
   };
 }
 
 /**
- * Computes the cross price between two assets using their oracle prices.
+ * Computes the amounts of both assets returned when burning `sharesToBurn`
+ * pool shares, based on the current pool reserves and total shares outstanding.
  *
- * Given `base` priced in quote units and `counter` priced in the same quote
- * units, returns how many `counter` units one `base` unit is worth, as a
- * decimal string with `decimals` places of precision.
- *
- * @param base     - Parsed price for the base asset.
- * @param counter  - Parsed price for the counter asset.
- * @param decimals - Output precision. Defaults to the base price decimals.
- * @throws Error when the counter price is zero.
+ * @param pool         - The liquidity pool record.
+ * @param sharesToBurn - Number of pool shares to burn, in stroops.
+ * @returns A WithdrawEstimate with the returned amounts.
  */
-export function computeCrossPrice(
-  base: ParsedOraclePrice,
-  counter: ParsedOraclePrice,
-  decimals: number = base.decimals
-): string {
-  const counterScaled = BigInt(counter.scaledPrice);
-  if (counterScaled === 0n) {
-    throw new Error("Cannot compute cross price with a zero counter price");
+export function calculateWithdraw(
+  pool: { reserves: { asset: string; amount: string }[]; totalShares: string },
+  sharesToBurn: string
+): WithdrawEstimate {
+  if (pool.reserves.length < 2) {
+    throw new InsufficientLiquidityError(
+      "Pool must have at least two reserve assets",
+      "0",
+      sharesToBurn
+    );
   }
 
-  const baseScaled = BigInt(base.scaledPrice);
-  const SCALE = 10n ** BigInt(decimals);
-  const result = (baseScaled * SCALE) / counterScaled;
+  const totalShares = BigInt(pool.totalShares);
+  const burn = BigInt(sharesToBurn);
 
-  return formatScaled(result, decimals);
+  if (totalShares <= 0n) {
+    throw new InsufficientLiquidityError(
+      "Pool has zero total shares",
+      "0",
+      sharesToBurn
+    );
+  }
+
+  const reserve0 = pool.reserves[0]!;
+  const reserve1 = pool.reserves[1]!;
+  const reserveA = BigInt(reserve0.amount);
+  const reserveB = BigInt(reserve1.amount);
+
+  if (burn <= 0n) {
+    return {
+      amountA: "0",
+      amountB: "0",
+      sharesBurned: "0",
+      assetA: reserve0.asset,
+      assetB: reserve1.asset,
+    };
+  }
+
+  // Returned amount: (burn / totalShares) * reserve
+  const amountA = (reserveA * burn) / totalShares;
+  const amountB = (reserveB * burn) / totalShares;
+
+  return {
+    amountA: amountA.toString(),
+    amountB: amountB.toString(),
+    sharesBurned: burn.toString(),
+    assetA: reserve0.asset,
+    assetB: reserve1.asset,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Slippage calculation
+// ---------------------------------------------------------------------------
+
+/**
+ * Computes the minimum acceptable output amount given an expected output and a
+ * slippage tolerance expressed in basis points (1 bps = 0.01 %).
+ *
+ * @param expectedOutput - Expected output amount, in stroops.
+ * @param slippageBps    - Slippage tolerance in basis points (e.g. 50 = 0.5 %).
+ * @returns The minimum acceptable output amount, in stroops.
+ */
+export function calculateMinimumOutput(
+  expectedOutput: string,
+  slippageBps: number
+): string {
+  if (slippageBps < 0 || slippageBps > 10000) {
+    throw new RangeError("slippageBps must be between 0 and 10000");
+  }
+
+  const expected = BigInt(expectedOutput);
+  if (expected <= 0n) {
+    return "0";
+  }
+
+  const bps = BigInt(Math.floor(slippageBps));
+  const minOutput = (expected * (10000n - bps)) / 10000n;
+  return minOutput.toString();
+}
+
+// ---------------------------------------------------------------------------
+// Swap routing across pools
+// ---------------------------------------------------------------------------
+
+/**
+ * A candidate pool for swap routing.
+ */
+export interface RoutingPool {
+  /** Unique pool identifier (e.g. the pool id). */
+  id: string;
+  /** Pool reserves. */
+  reserves: { asset: string; amount: string }[];
 }
 
 /**
- * Subscribes to oracle price updates for a set of assets, invoking `onUpdate`
- * whenever a new observation is produced.  Returns an unsubscribe function.
- *
- * The source is polled at `intervalMs`; each poll fetches every asset and
- * emits only observations whose price or timestamp changed since the previous
- * poll.  Errors from the source are forwarded to `onError` (if provided) and
- * do not stop the subscription.
- *
- * @param source     - The oracle source to poll.
- * @param assets     - Asset identifiers to watch.
- * @param onUpdate   - Callback invoked with each changed parsed price.
- * @param options    - Polling interval, parse options, and error handler.
- * @returns A function that stops the subscription when called.
+ * A single hop in a computed swap route.
  */
-export function subscribeToOraclePrices(
-  source: PriceOracleSource,
-  assets: string[],
-  onUpdate: (price: ParsedOraclePrice) => void,
-  options: OraclePriceOptions & {
-    intervalMs?: number;
-    onError?: (error: unknown) => void;
-  } = {}
-): () => void {
-  const intervalMs = options.intervalMs ?? 15_000;
-  const lastSeen = new Map<string, string>();
-  let stopped = false;
+export interface RouteHop {
+  poolId: string;
+  inputAsset: string;
+  outputAsset: string;
+  inputAmount: string;
+  outputAmount: string;
+  priceImpactPercent: string;
+}
 
-  const poll = async (): Promise<void> => {
-    for (const asset of assets) {
-      if (stopped) return;
-      try {
-        const parsed = await fetchOraclePrice(source, asset, options);
-        const fingerprint = `${parsed.price}@${parsed.timestamp}`;
-        if (lastSeen.get(asset) !== fingerprint) {
-          lastSeen.set(asset, fingerprint);
-          onUpdate(parsed);
-        }
-      } catch (error) {
-        options.onError?.(error);
-      }
+/**
+ * A computed swap route across one or more pools.
+ */
+export interface SwapRoute {
+  hops: RouteHop[];
+  inputAsset: string;
+  outputAsset: string;
+  inputAmount: string;
+  outputAmount: string;
+  /** Total price impact across all hops, as a percentage string. */
+  totalPriceImpactPercent: string;
+}
+
+/**
+ * Finds the best single-pool route for swapping `inputAmount` of `inputAsset`
+ * into `outputAsset` across the provided candidate pools.  Pools that do not
+ * contain both assets are skipped.  The route with the highest output amount
+ * is returned, or `null` when no pool can service the swap.
+ *
+ * @param pools       - Candidate pools to route through.
+ * @param inputAsset  - Asset being sold.
+ * @param outputAsset - Asset being bought.
+ * @param inputAmount - Amount of input asset, in stroops.
+ * @returns The best SwapRoute, or null if no route exists.
+ */
+export function findBestRoute(
+  pools: RoutingPool[],
+  inputAsset: string,
+  outputAsset: string,
+  inputAmount: string
+): SwapRoute | null {
+  if (inputAsset === outputAsset) {
+    return null;
+  }
+
+  let best: SwapRoute | null = null;
+
+  for (const pool of pools) {
+    const hasInput = pool.reserves.some((r) => r.asset === inputAsset);
+    const hasOutput = pool.reserves.some((r) => r.asset === outputAsset);
+    if (!hasInput || !hasOutput) {
+      continue;
     }
-  };
 
-  void poll();
-  const timer = setInterval(() => {
-    void poll();
-  }, intervalMs);
+    let estimate: PoolSwapEstimate;
+    try {
+      estimate = estimateSwapOutput(pool, inputAmount, inputAsset);
+    } catch {
+      continue;
+    }
 
-  return () => {
-    stopped = true;
-    clearInterval(timer);
+    const outputAmount = BigInt(estimate.outputAmount);
+    if (outputAmount <= 0n) {
+      continue;
+    }
+
+    if (best === null || outputAmount > BigInt(best.outputAmount)) {
+      best = {
+        hops: [
+          {
+            poolId: pool.id,
+            inputAsset,
+            outputAsset,
+            inputAmount,
+            outputAmount: estimate.outputAmount,
+            priceImpactPercent: estimate.priceImpactPercent,
+          },
+        ],
+        inputAsset,
+        outputAsset,
+        inputAmount,
+        outputAmount: estimate.outputAmount,
+        totalPriceImpactPercent: estimate.priceImpactPercent,
+      };
+    }
+  }
+
+  return best;
+}
+
+// ---------------------------------------------------------------------------
+// Pool monitoring
+// ---------------------------------------------------------------------------
+
+/**
+ * A snapshot of pool health metrics used for monitoring.
+ */
+export interface PoolHealthSnapshot {
+  poolId: string;
+  /** Reserve amounts keyed by asset. */
+  reserves: Record<string, string>;
+  totalShares: string;
+  /** Implied spot price of asset B per asset A, as a decimal string. */
+  spotPrice: string;
+  /** Whether either reserve is empty (pool is drained). */
+  drained: boolean;
+}
+
+/**
+ * Builds a monitoring snapshot for a pool, capturing reserves, total shares,
+ * and the implied spot price.  Useful for periodic health checks.
+ *
+ * @param pool - The liquidity pool record.
+ * @returns A PoolHealthSnapshot describing the pool's current state.
+ */
+export function buildPoolHealthSnapshot(
+  pool: { id: string; reserves: { asset: string; amount: string }[]; totalShares: string }
+): PoolHealthSnapshot {
+  const reserves: Record<string, string> = {};
+  for (const r of pool.reserves) {
+    reserves[r.asset] = r.amount;
+  }
+
+  let spotPrice = "0";
+  let drained = pool.reserves.length < 2;
+
+  if (pool.reserves.length >= 2) {
+    const reserveA = BigInt(pool.reserves[0]!.amount);
+    const reserveB = BigInt(pool.reserves[1]!.amount);
+    if (reserveA <= 0n || reserveB <= 0n) {
+      drained = true;
+    } else {
+      spotPrice = computeSpotPrice(reserveA, reserveB);
+    }
+  }
+
+  return {
+    poolId: pool.id,
+    reserves,
+    totalShares: pool.totalShares,
+    spotPrice,
+    drained,
   };
 }
 
@@ -397,110 +532,71 @@ export function subscribeToOraclePrices(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-function scaleDecimal(value: string, decimals: number): string {
-  const dot = value.indexOf(".");
-  const intPart = dot === -1 ? value : value.slice(0, dot);
-  const fracPart = dot === -1 ? "" : value.slice(dot + 1);
-  const paddedFrac = fracPart.padEnd(decimals, "0").slice(0, decimals);
-  return `${intPart}${paddedFrac}`.replace(/^0+(?=\d)/, "") || "0";
-}
-
-function formatScaled(value: bigint, decimals: number): string {
-  const SCALE = 10n ** BigInt(decimals);
-  const intPart = value / SCALE;
-  const fracPart = value % SCALE;
-  if (decimals === 0) return intPart.toString();
-  return `${intPart}.${fracPart.toString().padStart(decimals, "0")}`;
-}
-
-function ratioExceedsLimit(amount: bigint, reserve: bigint, limit: number): boolean {
-  if (!Number.isFinite(limit)) {
-    // Preserve the prior comparison semantics for non-finite caller values:
-    // NaN/+Infinity never reject, while -Infinity rejects every positive ratio.
-    return limit === -Infinity;
-  }
-
-  const [coefficient, exponentText] = limit.toString().toLowerCase().split("e");
-  const [integerPart, fractionalPart = ""] = coefficient!.split(".");
-  let numerator = BigInt(`${integerPart}${fractionalPart}`);
-  let denominator = 10n ** BigInt(fractionalPart.length);
-  const exponent = Number(exponentText ?? "0");
-
-  if (exponent > 0) {
-    numerator *= 10n ** BigInt(exponent);
-  } else if (exponent < 0) {
-    denominator *= 10n ** BigInt(-exponent);
-  }
-
-  return amount * denominator > reserve * numerator;
-}
-
 function computeSpotPrice(reserveIn: bigint, reserveOut: bigint): string {
-  // spotPrice = reserveOut / reserveIn as a decimal string
-  if (reserveIn === 0n) return "0";
-  return formatRatio(reserveOut, reserveIn);
+  if (reserveIn <= 0n) {
+    return "0";
+  }
+  // Scale by 1e7 to preserve precision, then format as decimal string.
+  const scaled = (reserveOut * 10000000n) / reserveIn;
+  return formatScaled(scaled, 7);
 }
 
 function computeEffectivePrice(outputAmount: bigint, inputAmount: bigint): string {
-  if (inputAmount === 0n) return "0";
-  return formatRatio(outputAmount, inputAmount);
+  if (inputAmount <= 0n) {
+    return "0";
+  }
+  const scaled = (outputAmount * 10000000n) / inputAmount;
+  return formatScaled(scaled, 7);
 }
 
 function computePriceImpact(spotPrice: string, effectivePrice: string): string {
-  // Parse the decimal strings safely by treating them as fractional strings.
-  // Since formatRatio now outputs exact decimal strings, we parse them as
-  // pairs of (integer, fractional) parts for high precision.
-  const parseDecimal = (s: string): { int: bigint; frac: bigint; scale: bigint } => {
-    const dot = s.indexOf(".");
-    if (dot === -1) return { int: BigInt(s), frac: 0n, scale: 1n };
-    const intPart = BigInt(s.slice(0, dot));
-    const fracPartStr = s.slice(dot + 1).padEnd(12, "0");
-    const scale = 10n ** BigInt(fracPartStr.length);
-    return { int: intPart, frac: BigInt(fracPartStr), scale };
-  };
-
-  const spot = parseDecimal(spotPrice);
-  const effective = parseDecimal(effectivePrice);
-  
-  const spotScaled = spot.int * spot.scale + spot.frac;
-  const effectiveScaled = effective.int * effective.scale + effective.frac;
-  const commonScale = spot.scale > effective.scale ? spot.scale : effective.scale;
-  const spotCommon = spotScaled * (commonScale / spot.scale);
-  const effectiveCommon = effectiveScaled * (commonScale / effective.scale);
-
-  if (spotCommon === 0n) return "0.00";
-
-  // (spot - effective) / spot * 100 with 4 decimal places of precision
-  const SCALE = 10000n;
-  const numerator = (spotCommon - effectiveCommon) * SCALE * 100n;
-  const denominator = spotCommon;
-
-  if (numerator <= 0n) return "0.00";
-
-  const result = numerator / denominator;
-  const intPart = result / SCALE;
-  const fracPart = result % SCALE;
-  const fracStr = fracPart.toString().padStart(4, "0").slice(0, 2);
-  return `${intPart}.${fracStr}`;
+  const spot = parseScaled(spotPrice, 7);
+  const effective = parseScaled(effectivePrice, 7);
+  if (spot <= 0n) {
+    return "0.00";
+  }
+  const diff = spot - effective;
+  if (diff <= 0n) {
+    return "0.00";
+  }
+  // impact% = diff / spot * 100, scaled by 100 for two decimals.
+  const impactScaled = (diff * 10000n) / spot;
+  return formatScaled(impactScaled, 2);
 }
 
-function computeOwnershipPercent(owned: bigint, total: bigint): string {
-  if (total === 0n) return "0.00";
-  // (owned / total) * 100 with 2 decimal places using BigInt
-  const SCALE = 10000n; // 100 * 100 for 2 decimal places
-  const scaled = (owned * SCALE * 100n) / total;
-  const intPart = scaled / SCALE;
-  const fracPart = scaled % SCALE;
-  const fracStr = fracPart.toString().padStart(4, "0").slice(0, 2);
-  return `${intPart}.${fracStr}`;
+function computeOwnershipPercent(owned: bigint, totalShares: bigint): string {
+  if (totalShares <= 0n) {
+    return "0.00";
+  }
+  const scaled = (owned * 10000n) / totalShares;
+  return formatScaled(scaled, 2);
 }
 
-function formatRatio(numerator: bigint, denominator: bigint): string {
-  if (denominator === 0n) return "0";
-  const SCALE = 10n ** 12n;
-  const scaled = (numerator * SCALE) / denominator;
-  const intPart = scaled / SCALE;
-  const fracPart = scaled % SCALE;
-  const fracStr = fracPart.toString().padStart(12, "0").replace(/0+$/, "");
-  return fracStr.length > 0 ? `${intPart}.${fracStr}` : intPart.toString();
+function ratioExceedsLimit(amountIn: bigint, reserveIn: bigint, maxRatio: number): boolean {
+  if (reserveIn <= 0n) {
+    return true;
+  }
+  // Compare amountIn / reserveIn > maxRatio without floating point on BigInts.
+  const scaledRatio = BigInt(Math.round(maxRatio * 1000000));
+  return amountIn * 1000000n > reserveIn * scaledRatio;
+}
+
+function formatScaled(value: bigint, decimals: number): string {
+  const negative = value < 0n;
+  const abs = negative ? -value : value;
+  const factor = 10n ** BigInt(decimals);
+  const whole = abs / factor;
+  const frac = abs % factor;
+  const fracStr = frac.toString().padStart(decimals, "0");
+  const result = decimals > 0 ? `${whole}.${fracStr}` : whole.toString();
+  return negative ? `-${result}` : result;
+}
+
+function parseScaled(value: string, decimals: number): bigint {
+  const negative = value.startsWith("-");
+  const clean = negative ? value.slice(1) : value;
+  const [whole, frac = ""] = clean.split(".");
+  const fracPadded = frac.padEnd(decimals, "0").slice(0, decimals);
+  const scaled = BigInt(whole || "0") * 10n ** BigInt(decimals) + BigInt(fracPadded || "0");
+  return negative ? -scaled : scaled;
 }
