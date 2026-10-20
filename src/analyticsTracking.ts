@@ -53,6 +53,31 @@ export interface MethodMetric {
   p99DurationMs: number;
 }
 
+export interface CacheMetric {
+  hits: number;
+  misses: number;
+  hitRate: number;
+}
+
+export interface BatchMetric {
+  operations: number;
+  failures: number;
+  failureRate: number;
+  totalItems: number;
+  avgDurationMs: number;
+  avgBatchSize: number;
+  maxDurationMs: number;
+}
+
+export interface PerformanceMetricsSnapshot {
+  generatedAt: number;
+  uptimeMs: number;
+  methods: Record<string, MethodMetric>;
+  cache: CacheMetric;
+  batch: BatchMetric;
+  counters: Record<string, number>;
+}
+
 export interface AnalyticsReport {
   generatedAt: number;
   periodMs: number;
@@ -210,12 +235,29 @@ interface MethodRecord {
   durations: number[];
 }
 
+interface BatchRecord {
+  operations: number;
+  failures: number;
+  totalItems: number;
+  totalDurationMs: number;
+  maxDurationMs: number;
+}
+
 export class AnalyticsCollector {
   private readonly maxQueueSize: number;
   private readonly events: AnalyticsEvent[] = [];
   private readonly methods = new Map<string, MethodRecord>();
   private readonly metrics = new Map<string, number>();
   private readonly categoryCounts = new Map<string, number>();
+  private cacheHits = 0;
+  private cacheMisses = 0;
+  private readonly batch: BatchRecord = {
+    operations: 0,
+    failures: 0,
+    totalItems: 0,
+    totalDurationMs: 0,
+    maxDurationMs: 0,
+  };
   private startTime: number = Date.now();
 
   constructor(maxQueueSize = 1000) {
@@ -253,6 +295,28 @@ export class AnalyticsCollector {
     this.metrics.set(name, (this.metrics.get(name) ?? 0) + value);
   }
 
+  /** Record a cache lookup outcome for hit/miss rate tracking. */
+  recordCache(hit: boolean): void {
+    if (hit) {
+      this.cacheHits += 1;
+    } else {
+      this.cacheMisses += 1;
+    }
+  }
+
+  /** Record a batch operation's duration, size, and success/failure. */
+  recordBatch(durationMs: number, size: number, success: boolean): void {
+    this.batch.operations += 1;
+    if (!success) {
+      this.batch.failures += 1;
+    }
+    this.batch.totalItems += size;
+    this.batch.totalDurationMs += durationMs;
+    if (durationMs > this.batch.maxDurationMs) {
+      this.batch.maxDurationMs = durationMs;
+    }
+  }
+
   getEvents(): AnalyticsEvent[] {
     return [...this.events];
   }
@@ -261,288 +325,66 @@ export class AnalyticsCollector {
     return Object.fromEntries(this.metrics.entries());
   }
 
+  getCacheMetric(): CacheMetric {
+    const total = this.cacheHits + this.cacheMisses;
+    return {
+      hits: this.cacheHits,
+      misses: this.cacheMisses,
+      hitRate: total === 0 ? 0 : this.cacheHits / total,
+    };
+  }
+
+  getBatchMetric(): BatchMetric {
+    const ops = this.batch.operations;
+    return {
+      operations: ops,
+      failures: this.batch.failures,
+      failureRate: ops === 0 ? 0 : this.batch.failures / ops,
+      totalItems: this.batch.totalItems,
+      avgDurationMs: ops === 0 ? 0 : this.batch.totalDurationMs / ops,
+      avgBatchSize: ops === 0 ? 0 : this.batch.totalItems / ops,
+      maxDurationMs: this.batch.maxDurationMs,
+    };
+  }
+
+  /**
+   * Export a standard-format performance metrics snapshot suitable for
+   * monitoring systems (Prometheus-style counters/gauges, JSON dashboards).
+   */
+  exportPerformanceMetrics(): PerformanceMetricsSnapshot {
+    const methods: Record<string, MethodMetric> = {};
+    for (const [name, rec] of this.methods.entries()) {
+      methods[name] = this.buildMethodMetric(rec);
+    }
+    return {
+      generatedAt: Date.now(),
+      uptimeMs: Date.now() - this.startTime,
+      methods,
+      cache: this.getCacheMetric(),
+      batch: this.getBatchMetric(),
+      counters: this.getMetrics(),
+    };
+  }
+
+  private buildMethodMetric(rec: MethodRecord): MethodMetric {
+    const sorted = [...rec.durations].sort((a, b) => a - b);
+    const sum = sorted.reduce((acc, v) => acc + v, 0);
+    return {
+      calls: rec.count,
+      errors: rec.errors,
+      errorRate: rec.count === 0 ? 0 : rec.errors / rec.count,
+      avgDurationMs: sorted.length === 0 ? 0 : sum / sorted.length,
+      minDurationMs: sorted.length === 0 ? 0 : sorted[0],
+      maxDurationMs: sorted.length === 0 ? 0 : sorted[sorted.length - 1],
+      p50DurationMs: this.calculatePercentile(sorted, 50),
+      p95DurationMs: this.calculatePercentile(sorted, 95),
+      p99DurationMs: this.calculatePercentile(sorted, 99),
+    };
+  }
+
   private calculatePercentile(sorted: number[], p: number): number {
     if (sorted.length === 0) return 0;
-    const index = Math.ceil((p / 100) * sorted.length) - 1;
-    return sorted[Math.max(0, Math.min(index, sorted.length - 1))] ?? 0;
+    const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
+    return sorted[idx];
   }
-
-  generateReport(privacyLevel: PrivacyLevel = "anonymized"): AnalyticsReport {
-    const now = Date.now();
-    const methodsReport: Record<string, MethodMetric> = {};
-
-    let totalMethodCalls = 0;
-    let totalErrors = 0;
-
-    for (const [method, rec] of this.methods.entries()) {
-      const sorted = [...rec.durations].sort((a, b) => a - b);
-      const sum = sorted.reduce((acc, d) => acc + d, 0);
-      const avg = sorted.length > 0 ? Number((sum / sorted.length).toFixed(2)) : 0;
-      const min = sorted.length > 0 ? (sorted[0] ?? 0) : 0;
-      const max = sorted.length > 0 ? (sorted[sorted.length - 1] ?? 0) : 0;
-      const errorRate = rec.count > 0 ? Number((rec.errors / rec.count).toFixed(4)) : 0;
-
-      totalMethodCalls += rec.count;
-      totalErrors += rec.errors;
-
-      methodsReport[method] = {
-        calls: rec.count,
-        errors: rec.errors,
-        errorRate,
-        avgDurationMs: avg,
-        minDurationMs: min,
-        maxDurationMs: max,
-        p50DurationMs: this.calculatePercentile(sorted, 50),
-        p95DurationMs: this.calculatePercentile(sorted, 95),
-        p99DurationMs: this.calculatePercentile(sorted, 99),
-      };
-    }
-
-    const overallErrorRate =
-      totalMethodCalls > 0 ? Number((totalErrors / totalMethodCalls).toFixed(4)) : 0;
-
-    return {
-      generatedAt: now,
-      periodMs: now - this.startTime,
-      privacyLevel,
-      totalEvents: this.events.length,
-      totalMethodCalls,
-      totalErrors,
-      overallErrorRate,
-      methods: methodsReport,
-      eventsByCategory: Object.fromEntries(this.categoryCounts.entries()),
-      metrics: Object.fromEntries(this.metrics.entries()),
-      events: [...this.events],
-    };
-  }
-
-  reset(): void {
-    this.events.length = 0;
-    this.methods.clear();
-    this.metrics.clear();
-    this.categoryCounts.clear();
-    this.startTime = Date.now();
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Main Analytics Tracker API
-// ---------------------------------------------------------------------------
-
-export class AnalyticsTracker {
-  private _enabled: boolean;
-  private readonly privacy: PrivacyController;
-  private readonly collector: AnalyticsCollector;
-  private readonly endpoint?: string;
-  private readonly onReport?: (report: AnalyticsReport) => void;
-  private readonly fetchFn: typeof fetch;
-  private flushTimer: ReturnType<typeof setInterval> | null = null;
-
-  constructor(options: AnalyticsTrackerOptions = {}) {
-    this.privacy = new PrivacyController(options.privacy);
-    // Respect Do Not Track
-    if (this.privacy.isDoNotTrackEnabled()) {
-      this._enabled = false;
-    } else {
-      this._enabled = options.enabled ?? false;
-    }
-
-    this.collector = new AnalyticsCollector(options.maxQueueSize ?? 1000);
-    this.endpoint = options.endpoint;
-    this.onReport = options.onReport;
-    this.fetchFn = options.fetchFn ?? (typeof fetch !== "undefined" ? fetch : (() => Promise.resolve({ ok: true })) as unknown as typeof fetch);
-
-    if (this._enabled && options.flushIntervalMs && options.flushIntervalMs > 0) {
-      this.flushTimer = setInterval(() => void this.flush(), options.flushIntervalMs);
-      if (typeof this.flushTimer === "object" && this.flushTimer !== null && "unref" in this.flushTimer) {
-        (this.flushTimer as NodeJS.Timeout).unref();
-      }
-    }
-  }
-
-  isEnabled(): boolean {
-    return this._enabled && !this.privacy.isDoNotTrackEnabled();
-  }
-
-  optIn(): void {
-    if (!this.privacy.isDoNotTrackEnabled()) {
-      this._enabled = true;
-    }
-  }
-
-  optOut(): void {
-    this._enabled = false;
-    this.collector.reset();
-  }
-
-  getPrivacyLevel(): PrivacyLevel {
-    return this.privacy.level;
-  }
-
-  /**
-   * Track an arbitrary SDK event with privacy scrubbing applied.
-   */
-  track(event: AnalyticsEventInput): void {
-    if (!this.isEnabled()) return;
-
-    const sanitizedProps = this.privacy.sanitizeProperties(event.properties);
-    const sanitizedEvent: AnalyticsEvent = {
-      name: this.privacy.sanitizeString(event.name),
-      category: event.category || "general",
-      properties: sanitizedProps,
-      timestamp: event.timestamp ?? Date.now(),
-    };
-
-    this.collector.recordEvent(sanitizedEvent);
-  }
-
-  /**
-   * Track method execution latency, success/failure status, and metadata.
-   */
-  trackMethod(
-    method: string,
-    durationMs: number,
-    success: boolean,
-    metadata?: Record<string, unknown>,
-  ): void {
-    if (!this.isEnabled()) return;
-
-    this.collector.recordMethod(method, Math.max(0, durationMs), success);
-    this.track({
-      name: `method:${method}`,
-      category: "method_call",
-      properties: {
-        method,
-        durationMs,
-        success,
-        ...metadata,
-      },
-    });
-  }
-
-  /**
-   * Track an error encountered during SDK operation.
-   */
-  trackError(error: Error | string, context?: Record<string, unknown>): void {
-    if (!this.isEnabled()) return;
-
-    const message = typeof error === "string" ? error : error.message;
-    const name = typeof error === "string" ? "Error" : error.name;
-
-    this.track({
-      name: "error_occurred",
-      category: "errors",
-      properties: {
-        errorName: name,
-        errorMessage: message,
-        ...context,
-      },
-    });
-    this.collector.recordMetric("error_count", 1);
-  }
-
-  /**
-   * Track a numerical metric counter or gauge.
-   */
-  trackMetric(name: string, value: number): void {
-    if (!this.isEnabled()) return;
-    this.collector.recordMetric(name, value);
-  }
-
-  /**
-   * Generate a comprehensive analytics report of all metrics accumulated.
-   */
-  generateReport(): AnalyticsReport {
-    const report = this.collector.generateReport(this.privacy.level);
-    if (this.onReport) {
-      try {
-        this.onReport(report);
-      } catch {
-        // Non-blocking report callback
-      }
-    }
-    return report;
-  }
-
-  /**
-   * Dispatch report to configured remote endpoint, notify onReport, and reset counters.
-   */
-  async flush(): Promise<AnalyticsReport | null> {
-    if (!this.isEnabled()) return null;
-
-    const report = this.generateReport();
-    this.collector.reset();
-
-    if (this.endpoint) {
-      try {
-        await this.fetchFn(this.endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(report),
-        });
-      } catch {
-        // Analytics flush failure must never break consumer operations
-      }
-    }
-
-    return report;
-  }
-
-  /**
-   * Cleanup timer resources and reset collector.
-   */
-  destroy(): void {
-    if (this.flushTimer !== null) {
-      clearInterval(this.flushTimer);
-      this.flushTimer = null;
-    }
-    this.collector.reset();
-  }
-}
-
-/**
- * Convenience helper to wrap any client or service with automated analytics tracking.
- */
-export function wrapClientWithAnalytics<T extends object>(
-  client: T,
-  tracker: AnalyticsTracker,
-): T {
-  if (!tracker.isEnabled()) {
-    return client;
-  }
-
-  return new Proxy(client, {
-    get(target, prop, receiver) {
-      const orig = Reflect.get(target, prop, receiver);
-      if (typeof orig === "function" && typeof prop === "string") {
-        return function (this: unknown, ...args: unknown[]) {
-          const start = Date.now();
-          try {
-            const result = (orig as (...a: unknown[]) => unknown).apply(this ?? target, args);
-            if (result && typeof result === "object" && "then" in result && typeof (result as Promise<unknown>).then === "function") {
-              return (result as Promise<unknown>)
-                .then((res) => {
-                  tracker.trackMethod(prop, Date.now() - start, true);
-                  return res;
-                })
-                .catch((err) => {
-                  tracker.trackMethod(prop, Date.now() - start, false, {
-                    errorMessage: (err as Error)?.message,
-                  });
-                  throw err;
-                });
-            }
-            tracker.trackMethod(prop, Date.now() - start, true);
-            return result;
-          } catch (err) {
-            tracker.trackMethod(prop, Date.now() - start, false, {
-              errorMessage: (err as Error)?.message,
-            });
-            throw err;
-          }
-        };
-      }
-      return orig;
-    },
-  });
 }
