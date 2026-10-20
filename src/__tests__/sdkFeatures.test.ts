@@ -1,9 +1,36 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import fc from "fast-check";
 import { StellarSplitClient } from "../client.js";
 import { TypedEventEmitter } from "../events/TypedEventEmitter.js";
 import { MetricsPlugin, PluginRegistry } from "../plugin.js";
 import { BatchTooLargeError } from "../errors.js";
 import type { CreateInvoiceParams } from "../types.js";
+
+// Property-based testing configuration (#1188).
+// fast-check provides generators and integrated shrinking so failing
+// properties are minimized to the smallest counterexample.
+const PROPERTY_RUNS = 100;
+const fcConfig = { numRuns: PROPERTY_RUNS };
+
+// Generators for relevant input domains.
+const bigintArb = fc.bigInt({ min: 0n, max: 2n ** 64n - 1n });
+const invoiceIdArb = fc.bigInt({ min: 1n, max: 2n ** 32n - 1n });
+const eventNameArb = fc.constantFrom("batch:created", "payment", "test");
+const methodNameArb = fc.constantFrom("createInvoice", "pay", "release", "refund");
+const pluginNameArb = fc.string({ minLength: 1, maxLength: 32 });
+
+// Result reporting helper: surfaces the shrunk counterexample clearly.
+function reportProperty(name: string, result: fc.RunDetails<unknown>): void {
+  if (result.failed) {
+    // eslint-disable-next-line no-console
+    console.error(
+      `[property:${name}] failed after ${result.numRuns} runs; ` +
+        `shrunk counterexample: ${JSON.stringify(result.counterexample, (_k, v) =>
+          typeof v === "bigint" ? `${v}n` : v,
+        )}`,
+    );
+  }
+}
 
 describe("SDK Features (#854, #855, #856, #857)", () => {
   // Mock config
@@ -185,6 +212,132 @@ describe("SDK Features (#854, #855, #856, #857)", () => {
       };
       expect(stats.totalInvoices).toBe(5);
       expect(stats.successRate).toBe(100);
+    });
+  });
+
+  describe("Property-based tests (#1188)", () => {
+    it("event bus delivers every emitted payload to all subscribers", () => {
+      const result = fc.check(
+        fc.property(
+          eventNameArb,
+          fc.array(fc.integer(), { maxLength: 5 }),
+          (eventName, payloads) => {
+            const emitter = new TypedEventEmitter<Record<string, unknown>>();
+            const received: unknown[] = [];
+            emitter.on(eventName, (p) => received.push(p));
+            for (const p of payloads) emitter.emit(eventName, p);
+            expect(received).toEqual(payloads);
+          },
+        ),
+        fcConfig,
+      );
+      reportProperty("event-bus-delivery", result);
+      expect(result.failed).toBe(false);
+    });
+
+    it("unsubscribe stops delivery regardless of emit count", () => {
+      const result = fc.check(
+        fc.property(
+          eventNameArb,
+          fc.integer({ min: 0, max: 20 }),
+          fc.integer({ min: 0, max: 20 }),
+          (eventName, before, after) => {
+            const emitter = new TypedEventEmitter<Record<string, unknown>>();
+            const handler = vi.fn();
+            const unsubscribe = emitter.on(eventName, handler);
+            for (let i = 0; i < before; i++) emitter.emit(eventName, i);
+            unsubscribe();
+            for (let i = 0; i < after; i++) emitter.emit(eventName, i);
+            expect(handler).toHaveBeenCalledTimes(before);
+          },
+        ),
+        fcConfig,
+      );
+      reportProperty("unsubscribe", result);
+      expect(result.failed).toBe(false);
+    });
+
+    it("metrics counts equal number of recorded calls per method", () => {
+      const result = fc.check(
+        fc.property(
+          fc.array(methodNameArb, { maxLength: 30 }),
+          (calls) => {
+            const plugin = new MetricsPlugin();
+            for (const m of calls) plugin.afterCall(m, { txHash: "h" });
+            const metrics = plugin.getMetrics();
+            const expected: Record<string, number> = {};
+            for (const m of calls) expected[m] = (expected[m] ?? 0) + 1;
+            expect(metrics).toEqual(expected);
+          },
+        ),
+        fcConfig,
+      );
+      reportProperty("metrics-counts", result);
+      expect(result.failed).toBe(false);
+    });
+
+    it("resetMetrics always yields empty metrics", () => {
+      const result = fc.check(
+        fc.property(fc.array(methodNameArb, { maxLength: 20 }), (calls) => {
+          const plugin = new MetricsPlugin();
+          for (const m of calls) plugin.afterCall(m, { txHash: "h" });
+          plugin.resetMetrics();
+          expect(plugin.getMetrics()).toEqual({});
+        }),
+        fcConfig,
+      );
+      reportProperty("metrics-reset", result);
+      expect(result.failed).toBe(false);
+    });
+
+    it("plugin registry tracks exactly the registered plugin names", () => {
+      const result = fc.check(
+        fc.property(fc.uniqueArray(pluginNameArb, { maxLength: 10 }), (names) => {
+          const registry = new PluginRegistry();
+          for (const name of names) registry.use({ name });
+          expect(registry.getPlugins().sort()).toEqual([...names].sort());
+        }),
+        fcConfig,
+      );
+      reportProperty("plugin-registry", result);
+      expect(result.failed).toBe(false);
+    });
+
+    it("batch size validation rejects out-of-range sizes", () => {
+      const result = fc.check(
+        fc.property(fc.integer({ min: 0, max: 40 }), (size) => {
+          const client = new StellarSplitClient(config);
+          const invoices = Array.from({ length: size }, () => ({})) as CreateInvoiceParams[];
+          const inRange = size >= 1 && size <= 20;
+          if (inRange) {
+            // In-range batches proceed past the size guard (may fail later on
+            // validation/RPC, but must not throw BatchTooLargeError).
+            expect(() => client.batchCreateInvoices(invoices)).not.toThrow(BatchTooLargeError);
+          } else {
+            expect(() => client.batchCreateInvoices(invoices)).rejects.toThrow(BatchTooLargeError);
+          }
+        }),
+        fcConfig,
+      );
+      reportProperty("batch-size", result);
+      expect(result.failed).toBe(false);
+    });
+
+    it("bigint invoice ids round-trip through event payloads", () => {
+      const result = fc.check(
+        fc.property(invoiceIdArb, bigintArb, (invoiceId, amount) => {
+          const emitter = new TypedEventEmitter<{
+            payment: { invoiceId: bigint; amount: bigint };
+          }>();
+          let received: { invoiceId: bigint; amount: bigint } | undefined;
+          emitter.on("payment", (p) => (received = p));
+          emitter.emit("payment", { invoiceId, amount });
+          expect(received).toEqual({ invoiceId, amount });
+        }),
+        fcConfig,
+      );
+      reportProperty("bigint-roundtrip", result);
+      expect(result.failed).toBe(false);
     });
   });
 });

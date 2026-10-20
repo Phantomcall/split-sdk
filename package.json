@@ -58,6 +58,7 @@
     "test:smoke": "vitest run tests/smoke.test.ts",
     "test:all": "vitest run",
     "test:e2e": "vitest run test/e2e",
+    "test:property": "vitest run test/property",
     "test:watch": "vitest",
     "test:bench": "vitest bench --run",
     "lint": "tsc --noEmit",
