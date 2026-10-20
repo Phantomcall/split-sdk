@@ -1,29 +1,69 @@
-name: Integration Test
+name: Integration Tests
 
 on:
-  schedule:
-    - cron: '0 0 * * 0' # weekly on Sunday at midnight
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
 
 jobs:
   integration-test:
+    name: Integration Tests
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 30
 
-      - uses: actions/setup-node@v4
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
+          node-version: '20'
+          cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Run integration tests (testnet only)
-        env:
-          STELLAR_NETWORK: testnet
-          STELLAR_SPLIT_CONTRACT_ID: ${{ secrets.STELLAR_SPLIT_CONTRACT_ID }}
-          STELLAR_SPLIT_TOKEN_CONTRACT_ID: ${{ secrets.STELLAR_SPLIT_TOKEN_CONTRACT_ID }}
+      - name: Run integration tests
         run: npm run test:integration
+        env:
+          CI: true
 
+  chaos-test:
+    name: Chaos Resilience Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: integration-test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run chaos experiments
+        run: npm run test:chaos
+        env:
+          CI: true
+          CHAOS_ENABLED: 'true'
+          CHAOS_SEED: ${{ github.run_id }}
+
+      - name: Upload chaos metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-metrics
+          path: |
+            chaos-metrics/**
+            chaos-report/**
+          if-no-files-found: ignore
+          retention-days: 14

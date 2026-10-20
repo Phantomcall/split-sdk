@@ -59,6 +59,7 @@
     "test:all": "vitest run",
     "test:e2e": "vitest run test/e2e",
     "test:property": "vitest run test/property",
+    "test:chaos": "vitest run test/chaos",
     "test:watch": "vitest",
     "test:bench": "vitest bench --run",
     "lint": "tsc --noEmit",

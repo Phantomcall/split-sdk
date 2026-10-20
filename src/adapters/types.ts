@@ -201,3 +201,95 @@ export interface RequestDeduplicator {
   /** Subscribe to deduplication events; returns an unsubscribe function. */
   onEvent(listener: DeduplicationEventListener): () => void;
 }
+
+/** Kind of failure a chaos experiment injects. */
+export type ChaosFaultKind = 'latency' | 'error' | 'timeout';
+
+/** A single fault-injection rule applied during a chaos experiment. */
+export interface ChaosFault {
+  /** Failure mode to inject. */
+  kind: ChaosFaultKind;
+  /**
+   * Probability (0..1) that the fault is applied to a given operation.
+   * Defaults to 1 (always apply).
+   */
+  probability?: number;
+  /** Delay in milliseconds for 'latency' faults. */
+  latencyMs?: number;
+  /** Error message surfaced for 'error' faults. */
+  message?: string;
+  /** Optional operation name the fault is scoped to; applies to all when omitted. */
+  target?: string;
+}
+
+/** A configurable chaos experiment definition. */
+export interface ChaosExperiment {
+  /** Unique experiment identifier. */
+  id: string;
+  /** Human-readable experiment name. */
+  name: string;
+  /** Optional description of the hypothesis being tested. */
+  description?: string;
+  /** Faults injected while the experiment runs. */
+  faults: ChaosFault[];
+  /** Maximum duration in milliseconds before the experiment is aborted. */
+  durationMs?: number;
+}
+
+/** Metrics collected for a single chaos experiment run. */
+export interface ChaosMetrics {
+  /** Total operations attempted. */
+  attempts: number;
+  /** Operations that succeeded. */
+  successes: number;
+  /** Operations that failed due to injected faults. */
+  failures: number;
+  /** Total injected latency in milliseconds. */
+  injectedLatencyMs: number;
+  /** Wall-clock duration of the run in milliseconds. */
+  durationMs: number;
+}
+
+/** Result of verifying recovery after a chaos experiment. */
+export interface ChaosRecoveryResult {
+  /** Whether the system recovered to a healthy state. */
+  recovered: boolean;
+  /** Number of probe attempts made during verification. */
+  attempts: number;
+  /** Error message when recovery failed. */
+  error?: string;
+}
+
+/** Lifecycle events emitted by the chaos runner. */
+export type ChaosEvent =
+  | { type: 'experiment-started'; experiment: ChaosExperiment }
+  | { type: 'fault-injected'; experimentId: string; fault: ChaosFault }
+  | { type: 'experiment-completed'; experimentId: string; metrics: ChaosMetrics }
+  | { type: 'recovery-verified'; experimentId: string; result: ChaosRecoveryResult }
+  | { type: 'experiment-failed'; experimentId: string; error: string };
+
+/** Listener invoked for each emitted chaos event. */
+export type ChaosEventListener = (event: ChaosEvent) => void;
+
+/**
+ * Chaos testing runner for verifying system resilience.
+ *
+ * Runs configurable experiments that inject faults, collects metrics, and
+ * verifies that the system recovers once faults are removed.
+ */
+export interface ChaosRunner {
+  /** Register an experiment definition. */
+  registerExperiment(experiment: ChaosExperiment): void;
+  /** Run a registered experiment against the given operation. */
+  runExperiment(
+    experimentId: string,
+    operation: () => Promise<unknown>,
+  ): Promise<ChaosMetrics>;
+  /** Verify recovery by probing the given operation until it succeeds. */
+  verifyRecovery(
+    operation: () => Promise<unknown>,
+    options?: { attempts?: number; intervalMs?: number },
+  ): Promise<ChaosRecoveryResult>;
+  /** Subscribe to chaos lifecycle events; returns an unsubscribe function. */
+  onEvent(listener: ChaosEventListener): () => void;
+}
