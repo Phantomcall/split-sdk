@@ -204,124 +204,144 @@ export interface SidechainAdapter {
   validateBridgeTransfer(params: BridgeTransferParams): Promise<BridgeValidationResult>;
   /** Synchronize local state with the sidechain head. */
   syncState(sidechain: SidechainNetwork): Promise<SidechainStateSnapshot>;
-  /** Retrieve aggregated sidechain analytics. */
-  getAnalytics(): Promise<SidechainAnalytics>;
+  /** Aggregate usage analytics for a sidechain. */
+  getAnalytics(sidechain: SidechainNetwork): Promise<SidechainAnalytics>;
   /** Subscribe to sidechain lifecycle events; returns an unsubscribe function. */
   onEvent(listener: SidechainEventListener): () => void;
 }
 
-/** A single operation to include in a multi-op invoice transaction. */
-export interface InvoiceOperation {
-  /** Operation kind (e.g. 'payment', 'create-account', 'change-trust'). */
-  type: string;
-  /** Operation-specific parameters. */
-  params: Record<string, unknown>;
-  /** Optional human-readable description of the operation. */
-  description?: string;
+/** Supported rollup protocols for batching and cost reduction. */
+export type RollupProtocol = 'optimistic' | 'zk';
+
+/** Lifecycle status of a rollup batch. */
+export type RollupBatchStatus =
+  | 'pending'
+  | 'submitted'
+  | 'proven'
+  | 'settled'
+  | 'failed';
+
+/** A single transaction included in a rollup batch. */
+export interface RollupTransaction {
+  /** Unique transaction identifier within the batch. */
+  id: string;
+  /** Sender address. */
+  from: string;
+  /** Recipient address. */
+  to: string;
+  /** Amount to transfer, as a decimal string. */
+  amount: string;
+  /** Optional asset identifier being transferred. */
+  asset?: string;
+  /** Optional calldata / memo attached to the transaction. */
+  data?: string;
 }
 
-/** Parameters for building a complex multi-op invoice transaction. */
-export interface InvoiceTransactionParams {
-  /** Stellar (G...) address funding the transaction. */
-  sourceAddress: string;
-  /** Network passphrase the transaction targets. */
-  network: string;
-  /** Optional memo attached to the transaction. */
-  memo?: string;
-  /** Ordered operations composing the invoice. */
-  operations: InvoiceOperation[];
+/** Parameters for creating a rollup batch. */
+export interface RollupBatchParams {
+  /** Rollup protocol the batch is submitted to. */
+  protocol: RollupProtocol;
+  /** Transactions to include in the batch. */
+  transactions: RollupTransaction[];
+  /** Optional maximum number of transactions per batch. */
+  maxBatchSize?: number;
 }
 
-/** A built, unsigned multi-op invoice transaction. */
-export interface InvoiceTransaction {
-  /** Base64-encoded unsigned transaction XDR. */
-  xdr: string;
-  /** Source account the transaction was built from. */
-  sourceAddress: string;
-  /** Network passphrase the transaction targets. */
-  network: string;
-  /** Operations included in the transaction, in order. */
-  operations: InvoiceOperation[];
-  /** Optional memo attached to the transaction. */
-  memo?: string;
-  /** Build timestamp (ms since epoch). */
+/** A rollup batch record tracking the submit/prove/settle lifecycle. */
+export interface RollupBatch {
+  /** Unique rollup batch identifier. */
+  id: string;
+  /** Rollup protocol the batch is submitted to. */
+  protocol: RollupProtocol;
+  /** Current lifecycle status. */
+  status: RollupBatchStatus;
+  /** Transactions included in the batch. */
+  transactions: RollupTransaction[];
+  /** Hash committing to the batch contents. */
+  batchHash: string;
+  /** Proof generated for the batch, once available. */
+  proof?: RollupProof;
+  /** Settlement transaction hash, once settled. */
+  settlementTxHash?: string;
+  /** Error message when the batch fails. */
+  error?: string;
+  /** Creation timestamp (ms since epoch). */
   createdAt: number;
+  /** Last update timestamp (ms since epoch). */
+  updatedAt: number;
 }
 
-/** Lifecycle events emitted by the invoice transaction builder. */
-export type InvoiceTransactionEvent =
-  | { type: 'build-started'; params: InvoiceTransactionParams }
-  | { type: 'operation-added'; operation: InvoiceOperation; index: number }
-  | { type: 'build-completed'; transaction: InvoiceTransaction }
-  | { type: 'build-failed'; error: string };
-
-/** Listener invoked for each emitted invoice transaction event. */
-export type InvoiceTransactionEventListener = (event: InvoiceTransactionEvent) => void;
-
-/**
- * Builder for composing complex multi-op invoice transactions.
- */
-export interface InvoiceTransactionBuilder {
-  /** Append an operation to the invoice. */
-  addOperation(operation: InvoiceOperation): InvoiceTransactionBuilder;
-  /** Build the unsigned transaction from the accumulated operations. */
-  build(): Promise<InvoiceTransaction>;
-  /** Subscribe to builder lifecycle events; returns an unsubscribe function. */
-  onEvent(listener: InvoiceTransactionEventListener): () => void;
+/** A validity proof generated for a rollup batch. */
+export interface RollupProof {
+  /** Rollup protocol the proof was generated for. */
+  protocol: RollupProtocol;
+  /** Proof payload (hex/base64 encoded). */
+  proof: string;
+  /** Public inputs the proof commits to. */
+  publicInputs: string[];
+  /** Generation timestamp (ms since epoch). */
+  generatedAt: number;
 }
 
+/** Result of optimizing a set of transactions into rollup batches. */
+export interface RollupBatchOptimizationResult {
+  /** Optimized batches ready for submission. */
+  batches: RollupBatch[];
+  /** Number of transactions that were batched. */
+  batchedCount: number;
+  /** Estimated cost savings versus submitting individually, as a decimal string. */
+  estimatedSavings: string;
+}
+
+/** Monitoring snapshot for a rollup adapter. */
+export interface RollupMonitoringSnapshot {
+  /** Rollup protocol being monitored. */
+  protocol: RollupProtocol;
+  /** Number of batches currently tracked. */
+  totalBatches: number;
+  /** Number of batches that settled successfully. */
+  settledCount: number;
+  /** Number of batches that failed. */
+  failedCount: number;
+  /** Average settlement latency in milliseconds. */
+  averageLatencyMs: number;
+  /** Snapshot timestamp (ms since epoch). */
+  updatedAt: number;
+}
+
+/** Rollup lifecycle events emitted to subscribers. */
+export type RollupEvent =
+  | { type: 'batch-created'; batch: RollupBatch }
+  | { type: 'batch-submitted'; batch: RollupBatch }
+  | { type: 'proof-generated'; batch: RollupBatch; proof: RollupProof }
+  | { type: 'batch-settled'; batch: RollupBatch; settlementTxHash: string }
+  | { type: 'batch-failed'; batch: RollupBatch; error: string }
+  | { type: 'monitoring-updated'; snapshot: RollupMonitoringSnapshot };
+
+/** Listener invoked for each emitted rollup event. */
+export type RollupEventListener = (event: RollupEvent) => void;
+
 /**
- * Configuration for optional request deduplication by nonce.
+ * Rollup adapter for batching transactions and reducing settlement costs.
  *
- * Deduplication is opt-in: when omitted (or `enabled` is false) requests
- * pass through unchanged and no nonce tracking occurs.
+ * Provides batch creation and optimization, proof generation, settlement,
+ * and monitoring for optimistic and zk rollup protocols.
  */
-export interface DeduplicationConfig {
-  /** Whether deduplication is enabled. Defaults to false. */
-  enabled?: boolean;
-  /**
-   * Time-to-live for a tracked nonce, in milliseconds. Once a nonce has been
-   * seen for longer than this window it is evicted and may be accepted again.
-   * When omitted, entries do not expire by time.
-   */
-  ttlMs?: number;
-  /**
-   * Maximum number of nonces retained. When exceeded, the oldest entries are
-   * evicted first (FIFO). When omitted, capacity is unbounded.
-   */
-  maxEntries?: number;
-}
-
-/** Outcome of a deduplication check for a single request nonce. */
-export type DeduplicationOutcome = 'accepted' | 'duplicate';
-
-/** Lifecycle events emitted by the request deduplicator. */
-export type DeduplicationEvent =
-  | { type: 'request-accepted'; nonce: string }
-  | { type: 'duplicate-detected'; nonce: string }
-  | { type: 'nonce-evicted'; nonce: string; reason: 'expired' | 'capacity' };
-
-/** Listener invoked for each emitted deduplication event. */
-export type DeduplicationEventListener = (event: DeduplicationEvent) => void;
-
-/**
- * Optional request deduplicator keyed by nonce.
- *
- * Implementations track previously seen nonces and report whether an incoming
- * request is a first-seen (accepted) or duplicate request.
- */
-export interface RequestDeduplicator {
-  /**
-   * Check a nonce and record it when first seen.
-   *
-   * @param nonce - Unique request nonce.
-   * @returns 'accepted' for a first-seen nonce, 'duplicate' otherwise.
-   */
-  check(nonce: string): DeduplicationOutcome;
-  /** Whether the given nonce is currently tracked. */
-  has(nonce: string): boolean;
-  /** Remove all tracked nonces. */
-  clear(): void;
-  /** Subscribe to deduplication events; returns an unsubscribe function. */
-  onEvent(listener: DeduplicationEventListener): () => void;
+export interface RollupAdapter {
+  /** Create a rollup batch from the given transactions. */
+  createBatch(params: RollupBatchParams): Promise<RollupBatch>;
+  /** Optimize transactions into cost-efficient batches. */
+  optimizeBatches(params: RollupBatchParams): Promise<RollupBatchOptimizationResult>;
+  /** Generate a validity proof for a batch. */
+  generateProof(batchId: string): Promise<RollupProof>;
+  /** Settle a proven batch on the main chain. */
+  settleBatch(batchId: string): Promise<RollupBatch>;
+  /** Fetch the current state of a rollup batch by id. */
+  getBatch(id: string): Promise<RollupBatch | undefined>;
+  /** List all known rollup batches. */
+  listBatches(): Promise<RollupBatch[]>;
+  /** Fetch a monitoring snapshot for the rollup protocol. */
+  getMonitoringSnapshot(protocol: RollupProtocol): Promise<RollupMonitoringSnapshot>;
+  /** Subscribe to rollup lifecycle events; returns an unsubscribe function. */
+  onEvent(listener: RollupEventListener): () => void;
 }
