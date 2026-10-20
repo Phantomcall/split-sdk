@@ -86,6 +86,130 @@ export interface BridgeClient {
   onEvent(listener: BridgeEventListener): () => void;
 }
 
+/** Supported sidechain networks for scalable off-main-chain settlement. */
+export type SidechainNetwork = 'polygon' | 'arbitrum' | 'optimism';
+
+/** Lifecycle status of an atomic swap between the main chain and a sidechain. */
+export type AtomicSwapStatus =
+  | 'initiated'
+  | 'counterparty-locked'
+  | 'completed'
+  | 'refunded'
+  | 'failed';
+
+/** Parameters for initiating an atomic swap across chains. */
+export interface AtomicSwapParams {
+  /** Sidechain the swap settles on. */
+  sidechain: SidechainNetwork;
+  /** Address on the main chain locking funds. */
+  initiatorAddress: string;
+  /** Address on the sidechain receiving the swapped funds. */
+  counterpartyAddress: string;
+  /** Amount to swap, as a decimal string. */
+  amount: string;
+  /** Optional asset identifier being swapped. */
+  asset?: string;
+  /** Hash of the secret used for the hash-time-locked contract. */
+  secretHash: string;
+  /** Unix timestamp (ms) after which the swap may be refunded. */
+  timeoutAt: number;
+}
+
+/** An atomic swap record tracking the initiate/complete/refund lifecycle. */
+export interface AtomicSwap {
+  /** Unique atomic swap identifier. */
+  id: string;
+  /** Current lifecycle status. */
+  status: AtomicSwapStatus;
+  /** Parameters the swap was initiated with. */
+  params: AtomicSwapParams;
+  /** Main-chain lock transaction hash, once submitted. */
+  mainChainTxHash?: string;
+  /** Sidechain lock transaction hash, once submitted. */
+  sidechainTxHash?: string;
+  /** Error message when the swap fails. */
+  error?: string;
+  /** Creation timestamp (ms since epoch). */
+  createdAt: number;
+  /** Last update timestamp (ms since epoch). */
+  updatedAt: number;
+}
+
+/** Result of validating a cross-chain bridge transfer before submission. */
+export interface BridgeValidationResult {
+  /** Whether the transfer passed all validation checks. */
+  valid: boolean;
+  /** Human-readable reasons for any failed checks. */
+  errors: string[];
+}
+
+/** Snapshot of synchronized state between the main chain and a sidechain. */
+export interface SidechainStateSnapshot {
+  /** Sidechain the snapshot belongs to. */
+  sidechain: SidechainNetwork;
+  /** Latest synchronized block height on the sidechain. */
+  blockHeight: number;
+  /** Hash of the last synchronized state root. */
+  stateRoot: string;
+  /** Whether the local view is in sync with the sidechain head. */
+  synced: boolean;
+  /** Snapshot timestamp (ms since epoch). */
+  updatedAt: number;
+}
+
+/** Aggregated analytics for sidechain usage and scalability. */
+export interface SidechainAnalytics {
+  /** Total number of bridge transfers observed. */
+  totalTransfers: number;
+  /** Total number of atomic swaps observed. */
+  totalSwaps: number;
+  /** Number of transfers/swaps that completed successfully. */
+  completedCount: number;
+  /** Number of transfers/swaps that failed or were refunded. */
+  failedCount: number;
+  /** Total value moved across the sidechain, as a decimal string. */
+  totalVolume: string;
+  /** Average settlement latency in milliseconds. */
+  averageLatencyMs: number;
+}
+
+/** Sidechain lifecycle events emitted to subscribers. */
+export type SidechainEvent =
+  | { type: 'swap-initiated'; swap: AtomicSwap }
+  | { type: 'swap-completed'; swap: AtomicSwap }
+  | { type: 'swap-refunded'; swap: AtomicSwap }
+  | { type: 'bridge-validated'; result: BridgeValidationResult }
+  | { type: 'state-synced'; snapshot: SidechainStateSnapshot }
+  | { type: 'analytics-updated'; analytics: SidechainAnalytics };
+
+/** Listener invoked for each emitted sidechain event. */
+export type SidechainEventListener = (event: SidechainEvent) => void;
+
+/**
+ * Sidechain adapter for scalable cross-chain settlement.
+ *
+ * Provides atomic swaps, bridge validation, state synchronization, and
+ * analytics for moving value between the main chain and a sidechain.
+ */
+export interface SidechainAdapter {
+  /** Initiate an atomic swap and return its initial record. */
+  initiateSwap(params: AtomicSwapParams): Promise<AtomicSwap>;
+  /** Complete an atomic swap by revealing the preimage of the secret hash. */
+  completeSwap(id: string, secret: string): Promise<AtomicSwap>;
+  /** Refund an expired atomic swap back to the initiator. */
+  refundSwap(id: string): Promise<AtomicSwap>;
+  /** Fetch the current state of an atomic swap by id. */
+  getSwap(id: string): Promise<AtomicSwap | undefined>;
+  /** Validate a bridge transfer before it is submitted. */
+  validateBridgeTransfer(params: BridgeTransferParams): Promise<BridgeValidationResult>;
+  /** Synchronize local state with the sidechain head. */
+  syncState(sidechain: SidechainNetwork): Promise<SidechainStateSnapshot>;
+  /** Retrieve aggregated sidechain analytics. */
+  getAnalytics(): Promise<SidechainAnalytics>;
+  /** Subscribe to sidechain lifecycle events; returns an unsubscribe function. */
+  onEvent(listener: SidechainEventListener): () => void;
+}
+
 /** A single operation to include in a multi-op invoice transaction. */
 export interface InvoiceOperation {
   /** Operation kind (e.g. 'payment', 'create-account', 'change-trust'). */
