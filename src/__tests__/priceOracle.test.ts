@@ -1,6 +1,15 @@
-import { describe, it, expect } from 'vitest';
-import fc from 'fast-check';
-import { PriceOracle } from '../priceOracle';
+import {
+  PriceOracle,
+  parseOraclePrice,
+  type OraclePrice,
+  type OracleProvider,
+} from "../priceOracle";
+
+describe("parseOraclePrice", () => {
+  it("parses a numeric price and timestamp", () => {
+    const result = parseOraclePrice("XLM", { price: 0.42, timestamp: 1700000000000 });
+    expect(result).toEqual({ symbol: "XLM", price: 0.42, timestamp: 1700000000000 });
+  });
 
 /**
  * Property-based tests for the PriceOracle.
@@ -92,5 +101,75 @@ describe('PriceOracle property-based tests', () => {
         }
       }),
     );
+  });
+});
+
+describe("PriceOracle multi-provider integration", () => {
+  const makeProvider = (
+    name: string,
+    fetch: OracleProvider["fetch"],
+  ): OracleProvider => ({ name, fetch });
+
+  it("aggregates prices across multiple providers", async () => {
+    const oracle = new PriceOracle([
+      makeProvider("a", async () => ({ price: 2 })),
+      makeProvider("b", async () => ({ price: 4 })),
+      makeProvider("c", async () => ({ price: 6 })),
+    ]);
+    const price = await oracle.fetchPrice("XLM");
+    expect(price.price).toBe(4);
+    expect(price.symbol).toBe("XLM");
+  });
+
+  it("falls back to remaining providers when one fails", async () => {
+    const oracle = new PriceOracle([
+      makeProvider("bad", async () => {
+        throw new Error("provider down");
+      }),
+      makeProvider("good", async () => ({ price: 5 })),
+    ]);
+    const price = await oracle.fetchPrice("XLM");
+    expect(price.price).toBe(5);
+  });
+
+  it("rejects invalid prices from a provider and uses valid ones", async () => {
+    const oracle = new PriceOracle([
+      makeProvider("invalid", async () => ({ price: -1 })),
+      makeProvider("valid", async () => ({ price: 3 })),
+    ]);
+    const price = await oracle.fetchPrice("XLM");
+    expect(price.price).toBe(3);
+  });
+
+  it("throws when all providers fail", async () => {
+    const oracle = new PriceOracle([
+      makeProvider("a", async () => {
+        throw new Error("down");
+      }),
+      makeProvider("b", async () => ({ price: 0 })),
+    ]);
+    await expect(oracle.fetchPrice("XLM")).rejects.toThrow(/No valid oracle price/);
+  });
+
+  it("enforces rate limiting between fetches", async () => {
+    const oracle = new PriceOracle(
+      [makeProvider("a", async () => ({ price: 1 }))],
+      { minIntervalMs: 1000 },
+    );
+    await oracle.fetchPrice("XLM");
+    await expect(oracle.fetchPrice("XLM")).rejects.toThrow(/rate limit/i);
+  });
+
+  it("reports provider health for monitoring", async () => {
+    const oracle = new PriceOracle([
+      makeProvider("ok", async () => ({ price: 2 })),
+      makeProvider("bad", async () => {
+        throw new Error("down");
+      }),
+    ]);
+    await oracle.fetchPrice("XLM");
+    const health = oracle.getProviderHealth();
+    expect(health.find((h) => h.name === "ok")?.healthy).toBe(true);
+    expect(health.find((h) => h.name === "bad")?.healthy).toBe(false);
   });
 });

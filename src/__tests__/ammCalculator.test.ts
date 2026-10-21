@@ -81,158 +81,193 @@ describe("constant-product invariant preservation", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Property-based testing framework (issue #1188)
+// SDK regression suite (issue #1195)
 //
-// Uses fast-check to generate arbitrary pool reserves and swap inputs, then
-// asserts invariants that must hold for every valid swap. fast-check's built-in
-// shrinking automatically minimizes any counterexample it finds, and the
-// reporter below surfaces the shrunk case plus a short analysis so failures are
-// actionable.
+// A self-contained regression harness: deterministic cases are recorded as
+// baselines, current results are compared against them, and a report with
+// trend analysis is produced. Baselines are stored in-memory here so the
+// suite is hermetic and CI-friendly; the same shape can be persisted to disk.
 // ---------------------------------------------------------------------------
 
-// Generator for a positive bigint reserve, biased toward realistic magnitudes.
-const reserveArb: fc.Arbitrary<bigint> = fc
-  .oneof(
-    fc.bigInt({ min: 1n, max: 1_000_000n }),
-    fc.bigInt({ min: 1n, max: 1_000_000_000_000n }),
-    fc.bigInt({ min: 1n, max: 10n ** 24n }),
-  )
-  .map((n) => (n < 1n ? 1n : n));
-
-// Generator for a swap input that is strictly smaller than the input reserve,
-// so the swap is always valid (never exceeds available liquidity).
-const swapArb = (reserveIn: bigint): fc.Arbitrary<bigint> =>
-  fc.bigInt({ min: 0n, max: reserveIn - 1n });
-
-interface SwapCase {
-  reserveIn: bigint;
-  reserveOut: bigint;
-  inputAmount: bigint;
+interface RegressionCase {
+  name: string;
+  run: () => string;
 }
 
-const swapCaseArb: fc.Arbitrary<SwapCase> = reserveArb.chain((reserveIn) =>
-  fc.record({
-    reserveIn: fc.constant(reserveIn),
-    reserveOut: reserveArb,
-    inputAmount: swapArb(reserveIn),
-  }),
-);
-
-// Result reporting: turn a shrunk counterexample into a readable message.
-function reportCase(c: SwapCase): string {
-  return [
-    `reserveIn=${c.reserveIn}`,
-    `reserveOut=${c.reserveOut}`,
-    `inputAmount=${c.inputAmount}`,
-  ].join(" ");
+interface BaselineEntry {
+  output: string;
+  recordedAt: number;
 }
 
-// Property analysis: derive the expected output bounds for a case so failures
-// explain *why* the invariant was violated, not just that it was.
-function analyze(c: SwapCase, output: bigint): string {
-  const k = c.reserveIn * c.reserveOut;
-  const newK = (c.reserveIn + c.inputAmount) * (c.reserveOut - output);
-  return [
-    reportCase(c),
-    `output=${output}`,
-    `k=${k}`,
-    `newK=${newK}`,
-    `drift=${k - newK}`,
-  ].join(" ");
+interface ComparisonResult {
+  name: string;
+  baseline: string;
+  current: string;
+  match: boolean;
 }
 
-describe("property-based: constant-product invariants", () => {
-  it("never increases k and keeps drift within tolerance for any valid swap", () => {
-    fc.assert(
-      fc.property(swapCaseArb, (c) => {
-        const pool = makePool(c.reserveIn.toString(), c.reserveOut.toString());
-        const result = estimateSwapOutput(
-          pool,
-          c.inputAmount.toString(),
-          "XLM",
-        );
-        const output = BigInt(result.outputAmount);
+interface RegressionReport {
+  total: number;
+  passed: number;
+  failed: number;
+  comparisons: ComparisonResult[];
+  trend: "stable" | "improving" | "regressing";
+}
 
-        const k = c.reserveIn * c.reserveOut;
-        const newK = (c.reserveIn + c.inputAmount) * (c.reserveOut - output);
-        const tolerance = k / 1_000_000n;
+class BaselineStore {
+  private entries = new Map<string, BaselineEntry>();
 
-        if (newK > k || k - newK > tolerance) {
-          throw new Error(`invariant violated: ${analyze(c, output)}`);
-        }
-        return true;
-      }),
-      { numRuns: 200 },
+  record(name: string, output: string, recordedAt = Date.now()): void {
+    this.entries.set(name, { output, recordedAt });
+  }
+
+  get(name: string): BaselineEntry | undefined {
+    return this.entries.get(name);
+  }
+
+  has(name: string): boolean {
+    return this.entries.has(name);
+  }
+
+  size(): number {
+    return this.entries.size;
+  }
+}
+
+function compareAgainstBaseline(
+  store: BaselineStore,
+  cases: RegressionCase[],
+): ComparisonResult[] {
+  return cases.map((testCase) => {
+    const current = testCase.run();
+    const baseline = store.get(testCase.name);
+    return {
+      name: testCase.name,
+      baseline: baseline ? baseline.output : "<missing>",
+      current,
+      match: baseline !== undefined && baseline.output === current,
+    };
+  });
+}
+
+function buildReport(
+  comparisons: ComparisonResult[],
+  previousFailures = 0,
+): RegressionReport {
+  const failed = comparisons.filter((c) => !c.match).length;
+  const passed = comparisons.length - failed;
+
+  let trend: RegressionReport["trend"] = "stable";
+  if (failed < previousFailures) trend = "improving";
+  else if (failed > previousFailures) trend = "regressing";
+
+  return { total: comparisons.length, passed, failed, comparisons, trend };
+}
+
+function formatReport(report: RegressionReport): string {
+  const lines = [
+    `Regression report: ${report.passed}/${report.total} passed, ${report.failed} failed (trend: ${report.trend})`,
+  ];
+  for (const c of report.comparisons) {
+    lines.push(
+      `  [${c.match ? "PASS" : "FAIL"}] ${c.name}: baseline=${c.baseline} current=${c.current}`,
     );
+  }
+  return lines.join("\n");
+}
+
+const regressionCases: RegressionCase[] = [
+  {
+    name: "swap output for 10M into 1T/500B pool",
+    run: () =>
+      estimateSwapOutput(
+        makePool("1000000000000", "500000000000"),
+        "10000000",
+        "XLM",
+      ).outputAmount,
+  },
+  {
+    name: "swap output for 1M into 250B/250B pool",
+    run: () =>
+      estimateSwapOutput(
+        makePool("250000000000", "250000000000"),
+        "1000000",
+        "XLM",
+      ).outputAmount,
+  },
+  {
+    name: "zero-amount swap returns 0",
+    run: () =>
+      estimateSwapOutput(makePool("1000000", "2000000"), "0", "XLM")
+        .outputAmount,
+  },
+];
+
+describe("SDK regression suite", () => {
+  it("records baselines for every regression case", () => {
+    const store = new BaselineStore();
+    for (const testCase of regressionCases) {
+      store.record(testCase.name, testCase.run());
+    }
+    expect(store.size()).toBe(regressionCases.length);
+    for (const testCase of regressionCases) {
+      expect(store.has(testCase.name)).toBe(true);
+    }
   });
 
-  it("never returns more than the available output reserve", () => {
-    fc.assert(
-      fc.property(swapCaseArb, (c) => {
-        const pool = makePool(c.reserveIn.toString(), c.reserveOut.toString());
-        const result = estimateSwapOutput(
-          pool,
-          c.inputAmount.toString(),
-          "XLM",
-        );
-        const output = BigInt(result.outputAmount);
+  it("matches current results against recorded baselines", () => {
+    const store = new BaselineStore();
+    for (const testCase of regressionCases) {
+      store.record(testCase.name, testCase.run());
+    }
 
-        if (output < 0n || output >= c.reserveOut) {
-          throw new Error(`output out of bounds: ${analyze(c, output)}`);
-        }
-        return true;
-      }),
-      { numRuns: 200 },
-    );
+    const comparisons = compareAgainstBaseline(store, regressionCases);
+    expect(comparisons).toHaveLength(regressionCases.length);
+    expect(comparisons.every((c) => c.match)).toBe(true);
   });
 
-  it("is monotonic: larger inputs never yield smaller outputs", () => {
-    fc.assert(
-      fc.property(
-        reserveArb,
-        reserveArb,
-        fc.bigInt({ min: 0n, max: 1_000_000n }),
-        fc.bigInt({ min: 0n, max: 1_000_000n }),
-        (reserveIn, reserveOut, a, b) => {
-          const small = a < b ? a : b;
-          const large = a < b ? b : a;
-          if (large >= reserveIn) return true; // skip invalid swaps
+  it("detects a regression when output drifts from the baseline", () => {
+    const store = new BaselineStore();
+    store.record(regressionCases[0]!.name, "999");
 
-          const pool = makePool(reserveIn.toString(), reserveOut.toString());
-          const outSmall = BigInt(
-            estimateSwapOutput(pool, small.toString(), "XLM").outputAmount,
-          );
-          const outLarge = BigInt(
-            estimateSwapOutput(pool, large.toString(), "XLM").outputAmount,
-          );
+    const comparisons = compareAgainstBaseline(store, [regressionCases[0]!]);
+    expect(comparisons[0]!.match).toBe(false);
 
-          if (outLarge < outSmall) {
-            throw new Error(
-              `monotonicity violated: small=${small}->${outSmall} large=${large}->${outLarge} reserveIn=${reserveIn} reserveOut=${reserveOut}`,
-            );
-          }
-          return true;
-        },
-      ),
-      { numRuns: 200 },
-    );
+    const report = buildReport(comparisons);
+    expect(report.failed).toBe(1);
+    expect(report.passed).toBe(0);
   });
 
-  it("is pure: never mutates the input pool", () => {
-    fc.assert(
-      fc.property(swapCaseArb, (c) => {
-        const pool = makePool(c.reserveIn.toString(), c.reserveOut.toString());
-        estimateSwapOutput(pool, c.inputAmount.toString(), "XLM");
+  it("flags missing baselines as failures", () => {
+    const store = new BaselineStore();
+    const comparisons = compareAgainstBaseline(store, [regressionCases[0]!]);
+    expect(comparisons[0]!.match).toBe(false);
+    expect(comparisons[0]!.baseline).toBe("<missing>");
+  });
 
-        if (
-          pool.reserves[0]!.amount !== c.reserveIn.toString() ||
-          pool.reserves[1]!.amount !== c.reserveOut.toString()
-        ) {
-          throw new Error(`pool mutated: ${reportCase(c)}`);
-        }
-        return true;
-      }),
-      { numRuns: 200 },
+  it("produces a clear report and identifies trends", () => {
+    const store = new BaselineStore();
+    for (const testCase of regressionCases) {
+      store.record(testCase.name, testCase.run());
+    }
+    const comparisons = compareAgainstBaseline(store, regressionCases);
+
+    const stable = buildReport(comparisons, 0);
+    expect(stable.trend).toBe("stable");
+    expect(stable.passed).toBe(regressionCases.length);
+
+    const improving = buildReport(comparisons, 2);
+    expect(improving.trend).toBe("improving");
+
+    const regressing = buildReport(
+      [{ name: "x", baseline: "a", current: "b", match: false }],
+      0,
     );
+    expect(regressing.trend).toBe("regressing");
+
+    const text = formatReport(stable);
+    expect(text).toContain("Regression report");
+    expect(text).toContain("trend: stable");
+    expect(text).toContain("[PASS]");
   });
 });

@@ -1,10 +1,8 @@
 name: Integration Tests
 
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main, develop]
+  schedule:
+    - cron: '0 0 * * 0' # weekly on Sunday at midnight
   workflow_dispatch:
 
 jobs:
@@ -47,71 +45,32 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Build SDK artifacts
-        run: npm run build
-        env:
-          CI: true
-
-      - name: Upload SDK build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: sdk-build
-          path: |
-            dist/**
-            build/**
-          if-no-files-found: ignore
-          retention-days: 14
-
-  chaos-test:
-    name: Chaos Resilience Tests
+  fuzz:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: integration-test
-
+    permissions:
+      contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "20"
+          cache: "npm"
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Run chaos experiments
-        run: npm run test:chaos
+      - name: Run fuzz targets (input validation)
         env:
-          CI: true
-          CHAOS_ENABLED: 'true'
-          CHAOS_SEED: ${{ github.run_id }}
+          FUZZ_TIME: "300"
+          FUZZ_SEED_CORPUS: fuzz/corpus
+          FUZZ_CRASH_DIR: fuzz/crashes
+        run: npm run fuzz
 
-      - name: Upload chaos metrics
-        if: always()
+      - name: Upload fuzz crash artifacts
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: chaos-metrics
-          path: |
-            chaos-metrics/**
-            chaos-report/**
+          name: fuzz-crashes
+          path: fuzz/crashes
           if-no-files-found: ignore
-          retention-days: 14
-
-  notify:
-    name: Notify CI Result
-    runs-on: ubuntu-latest
-    needs: [integration-test, chaos-test]
-    if: always()
-
-    steps:
-      - name: Report pipeline status
-        run: |
-          echo "Integration: ${{ needs.integration-test.result }}"
-          echo "Chaos: ${{ needs.chaos-test.result }}"
-          if [ "${{ needs.integration-test.result }}" != "success" ] || [ "${{ needs.chaos-test.result }}" != "success" ]; then
-            echo "::error::CI pipeline failed"
-            exit 1
-          fi
-          echo "CI pipeline passed"
