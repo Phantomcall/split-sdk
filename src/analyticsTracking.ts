@@ -5,7 +5,7 @@
  * Strictly opt-in (enabled: false by default).
  */
 
-import { createHash } from "crypto";
+import { createHash, randomBytes } from "crypto";
 
 export type PrivacyLevel = "strict" | "anonymized" | "standard";
 
@@ -425,6 +425,8 @@ export class AnalyticsCollector {
         p95DurationMs: this.calculatePercentile(sorted, 95),
         p99DurationMs: this.calculatePercentile(sorted, 99),
       };
+      totalMethodCalls += rec.count;
+      totalErrors += rec.errors;
     }
     return out;
   }
