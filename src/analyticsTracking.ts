@@ -193,6 +193,31 @@ export interface MethodMetric {
   p99DurationMs: number;
 }
 
+export interface CacheMetric {
+  hits: number;
+  misses: number;
+  hitRate: number;
+}
+
+export interface BatchMetric {
+  operations: number;
+  failures: number;
+  failureRate: number;
+  totalItems: number;
+  avgDurationMs: number;
+  avgBatchSize: number;
+  maxDurationMs: number;
+}
+
+export interface PerformanceMetricsSnapshot {
+  generatedAt: number;
+  uptimeMs: number;
+  methods: Record<string, MethodMetric>;
+  cache: CacheMetric;
+  batch: BatchMetric;
+  counters: Record<string, number>;
+}
+
 export interface AnalyticsReport {
   generatedAt: number;
   periodMs: number;
@@ -352,12 +377,29 @@ interface MethodRecord {
   durations: number[];
 }
 
+interface BatchRecord {
+  operations: number;
+  failures: number;
+  totalItems: number;
+  totalDurationMs: number;
+  maxDurationMs: number;
+}
+
 export class AnalyticsCollector {
   private readonly maxQueueSize: number;
   private readonly events: AnalyticsEvent[] = [];
   private readonly methods = new Map<string, MethodRecord>();
   private readonly metrics = new Map<string, number>();
   private readonly categoryCounts = new Map<string, number>();
+  private cacheHits = 0;
+  private cacheMisses = 0;
+  private readonly batch: BatchRecord = {
+    operations: 0,
+    failures: 0,
+    totalItems: 0,
+    totalDurationMs: 0,
+    maxDurationMs: 0,
+  };
   private startTime: number = Date.now();
 
   constructor(maxQueueSize = 1000) {

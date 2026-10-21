@@ -95,6 +95,125 @@ export class AnalyticsExportEventEmitter {
   }
 }
 
+/**
+ * Aggregated histogram snapshot for a single metric key.
+ */
+export interface MetricsHistogramSnapshot {
+  count: number;
+  sum: number;
+  min: number;
+  max: number;
+  avg: number;
+}
+
+/**
+ * Standard-format metrics export payload (Prometheus-style naming).
+ */
+export interface MetricsExport {
+  counters: Record<string, number>;
+  gauges: Record<string, number>;
+  histograms: Record<string, MetricsHistogramSnapshot>;
+  /** Cache hit rate in [0, 1], or null when no lookups were recorded. */
+  cacheHitRate: number | null;
+}
+
+/**
+ * Lightweight, dependency-free metrics collector.
+ *
+ * Designed for minimal overhead: counters/gauges are plain map updates and
+ * histograms keep running aggregates (no unbounded sample storage).
+ */
+export class MetricsCollector {
+  private readonly counters = new Map<string, number>();
+  private readonly gauges = new Map<string, number>();
+  private readonly histograms = new Map<string, MetricsHistogramSnapshot>();
+  private cacheHits = 0;
+  private cacheMisses = 0;
+
+  increment(name: string, value = 1): void {
+    this.counters.set(name, (this.counters.get(name) ?? 0) + value);
+  }
+
+  gauge(name: string, value: number): void {
+    this.gauges.set(name, value);
+  }
+
+  observe(name: string, value: number): void {
+    const current = this.histograms.get(name);
+    if (!current) {
+      this.histograms.set(name, {
+        count: 1,
+        sum: value,
+        min: value,
+        max: value,
+        avg: value,
+      });
+      return;
+    }
+    const count = current.count + 1;
+    const sum = current.sum + value;
+    this.histograms.set(name, {
+      count,
+      sum,
+      min: Math.min(current.min, value),
+      max: Math.max(current.max, value),
+      avg: sum / count,
+    });
+  }
+
+  /** Time an RPC request by method name, recording latency in ms. */
+  async timeRpc<T>(method: string, fn: () => Promise<T>): Promise<T> {
+    const start = Date.now();
+    try {
+      const result = await fn();
+      this.increment(`rpc.${method}.success`);
+      return result;
+    } catch (error) {
+      this.increment(`rpc.${method}.error`);
+      throw error;
+    } finally {
+      this.observe(`rpc.${method}.latency_ms`, Date.now() - start);
+    }
+  }
+
+  /** Record a cache lookup outcome. */
+  recordCache(hit: boolean): void {
+    if (hit) {
+      this.cacheHits += 1;
+      this.increment("cache.hits");
+    } else {
+      this.cacheMisses += 1;
+      this.increment("cache.misses");
+    }
+  }
+
+  /** Record a batch operation's duration and size. */
+  recordBatch(size: number, durationMs: number, success: boolean): void {
+    this.increment(success ? "batch.success" : "batch.failure");
+    this.observe("batch.size", size);
+    this.observe("batch.duration_ms", durationMs);
+  }
+
+  /** Export all metrics in a standard, serializable format. */
+  export(): MetricsExport {
+    const total = this.cacheHits + this.cacheMisses;
+    return {
+      counters: Object.fromEntries(this.counters),
+      gauges: Object.fromEntries(this.gauges),
+      histograms: Object.fromEntries(this.histograms),
+      cacheHitRate: total === 0 ? null : this.cacheHits / total,
+    };
+  }
+
+  reset(): void {
+    this.counters.clear();
+    this.gauges.clear();
+    this.histograms.clear();
+    this.cacheHits = 0;
+    this.cacheMisses = 0;
+  }
+}
+
 function resolveColumns(
   rows: AnalyticsDashboardRow[],
   columns?: string[],
@@ -180,6 +299,7 @@ export interface AnalyticsStreamStats {
  */
 export class AnalyticsDashboardExporter {
   readonly events = new AnalyticsExportEventEmitter();
+  readonly metrics = new MetricsCollector();
 
   on<K extends AnalyticsExportEventName>(
     event: K,
@@ -213,11 +333,15 @@ export class AnalyticsDashboardExporter {
       filename,
     });
 
+    const start = Date.now();
     try {
       const data =
         format === "csv"
           ? toCsv(safeRows, resolveColumns(safeRows, options.columns))
           : toJson(safeRows);
+
+      this.metrics.increment("export.success");
+      this.metrics.observe("export.duration_ms", Date.now() - start);
 
       this.events.emit("complete", {
         format,
@@ -229,6 +353,8 @@ export class AnalyticsDashboardExporter {
       return data;
     } catch (cause) {
       const error = cause instanceof Error ? cause : new Error(String(cause));
+      this.metrics.increment("export.error");
+      this.metrics.observe("export.duration_ms", Date.now() - start);
       this.events.emit("error", { format, filename, error });
       throw error;
     }
