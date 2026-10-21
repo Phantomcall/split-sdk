@@ -408,5 +408,5 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full guide.
 <!-- handsoff-issue-912 -->
 - #912: Implement advanced filter DSL for invoice queries
 
-<!-- handsoff-issue-1164 -->
-- #1164: Add privacy pools for confidential transactions
+<!-- handsoff-issue-1169 -->
+- #1169: Implement query optimization with indexes
