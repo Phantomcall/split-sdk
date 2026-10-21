@@ -2008,3 +2008,16 @@ export type {
   NonceEventListener,
 } from "./nonceManager.js";
 
+// Webhook signature verification (#617)
+export {
+  verifyWebhookSignature,
+  verifyWebhookSignatureOrThrow,
+  WebhookVerificationError,
+} from "./webhooks/verify.js";
+
+// Array pagination helper (#618)
+export { paginateArray } from "./horizonPaginator.js";
+
+// Metadata compression helpers (#619)
+export { compressMetadata, decompressMetadata } from "./compression.js";
+
