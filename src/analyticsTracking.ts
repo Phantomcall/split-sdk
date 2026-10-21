@@ -5,9 +5,149 @@
  * Strictly opt-in (enabled: false by default).
  */
 
-import { createHash } from "crypto";
+import { createHash, randomBytes } from "crypto";
 
 export type PrivacyLevel = "strict" | "anonymized" | "standard";
+
+// ---------------------------------------------------------------------------
+// Debug Mode
+// ---------------------------------------------------------------------------
+
+export type DebugLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
+
+const DEBUG_LEVEL_ORDER: Record<DebugLevel, number> = {
+  off: 0,
+  error: 1,
+  warn: 2,
+  info: 3,
+  debug: 4,
+  trace: 5,
+};
+
+export interface DebugConfig {
+  /** Active debug level threshold. Default: "off". */
+  level?: DebugLevel;
+  /** Sink for formatted debug lines. Default: console. */
+  logger?: (line: string) => void;
+  /** Named breakpoints that should pause/flag execution. */
+  breakpoints?: string[];
+  /** Callback invoked when a breakpoint is hit. */
+  onBreakpoint?: (name: string, context?: Record<string, unknown>) => void;
+}
+
+/**
+ * Debug utilities: level gating, verbose logging, breakpoints, and state inspection.
+ */
+export class DebugController {
+  private level: DebugLevel;
+  private readonly logger: (line: string) => void;
+  private readonly breakpoints = new Set<string>();
+  private readonly onBreakpoint?: (name: string, context?: Record<string, unknown>) => void;
+  private readonly hits = new Map<string, number>();
+
+  constructor(config?: DebugConfig) {
+    this.level = config?.level ?? "off";
+    this.logger = config?.logger ?? ((line) => console.log(line));
+    this.onBreakpoint = config?.onBreakpoint;
+    for (const bp of config?.breakpoints ?? []) {
+      this.breakpoints.add(bp);
+    }
+  }
+
+  get currentLevel(): DebugLevel {
+    return this.level;
+  }
+
+  setLevel(level: DebugLevel): void {
+    this.level = level;
+  }
+
+  enable(level: DebugLevel = "debug"): void {
+    this.level = level;
+  }
+
+  disable(): void {
+    this.level = "off";
+  }
+
+  isEnabled(level: DebugLevel = "debug"): boolean {
+    return DEBUG_LEVEL_ORDER[this.level] >= DEBUG_LEVEL_ORDER[level];
+  }
+
+  /** Emit a verbose log line gated by the active debug level. */
+  log(level: Exclude<DebugLevel, "off">, message: string, context?: Record<string, unknown>): void {
+    if (!this.isEnabled(level)) return;
+    const ts = new Date().toISOString();
+    const suffix = context ? ` ${this.format(context)}` : "";
+    this.logger(`[${ts}] [${level.toUpperCase()}] ${message}${suffix}`);
+  }
+
+  error(message: string, context?: Record<string, unknown>): void {
+    this.log("error", message, context);
+  }
+
+  warn(message: string, context?: Record<string, unknown>): void {
+    this.log("warn", message, context);
+  }
+
+  info(message: string, context?: Record<string, unknown>): void {
+    this.log("info", message, context);
+  }
+
+  debug(message: string, context?: Record<string, unknown>): void {
+    this.log("debug", message, context);
+  }
+
+  trace(message: string, context?: Record<string, unknown>): void {
+    this.log("trace", message, context);
+  }
+
+  addBreakpoint(name: string): void {
+    this.breakpoints.add(name);
+  }
+
+  removeBreakpoint(name: string): void {
+    this.breakpoints.delete(name);
+  }
+
+  /**
+   * Flag execution at a named breakpoint when debug mode is enabled.
+   * Returns true when the breakpoint is active and was hit.
+   */
+  breakpoint(name: string, context?: Record<string, unknown>): boolean {
+    if (!this.isEnabled("debug") || !this.breakpoints.has(name)) return false;
+    this.hits.set(name, (this.hits.get(name) ?? 0) + 1);
+    this.log("debug", `breakpoint hit: ${name}`, context);
+    this.onBreakpoint?.(name, context);
+    return true;
+  }
+
+  getBreakpointHits(): Record<string, number> {
+    return Object.fromEntries(this.hits.entries());
+  }
+
+  /** Format a value for debug output (safe against circular references). */
+  format(value: unknown): string {
+    const seen = new WeakSet<object>();
+    try {
+      return JSON.stringify(value, (_key, val) => {
+        if (typeof val === "object" && val !== null) {
+          if (seen.has(val as object)) return "[Circular]";
+          seen.add(val as object);
+        }
+        if (typeof val === "bigint") return val.toString();
+        return val;
+      });
+    } catch {
+      return String(value);
+    }
+  }
+
+  /** Inspect arbitrary state for debugging. */
+  inspect(label: string, state: unknown): void {
+    this.log("debug", `inspect ${label}`, { state });
+  }
+}
 
 export interface AnalyticsPrivacyConfig {
   /**
@@ -107,6 +247,8 @@ export interface AnalyticsTrackerOptions {
   onReport?: (report: AnalyticsReport) => void;
   /** Optional custom fetch implementation for network reporting. */
   fetchFn?: typeof fetch;
+  /** Debug mode configuration for verbose operation logging. */
+  debug?: DebugConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -295,28 +437,6 @@ export class AnalyticsCollector {
     this.metrics.set(name, (this.metrics.get(name) ?? 0) + value);
   }
 
-  /** Record a cache lookup outcome for hit/miss rate tracking. */
-  recordCache(hit: boolean): void {
-    if (hit) {
-      this.cacheHits += 1;
-    } else {
-      this.cacheMisses += 1;
-    }
-  }
-
-  /** Record a batch operation's duration, size, and success/failure. */
-  recordBatch(durationMs: number, size: number, success: boolean): void {
-    this.batch.operations += 1;
-    if (!success) {
-      this.batch.failures += 1;
-    }
-    this.batch.totalItems += size;
-    this.batch.totalDurationMs += durationMs;
-    if (durationMs > this.batch.maxDurationMs) {
-      this.batch.maxDurationMs = durationMs;
-    }
-  }
-
   getEvents(): AnalyticsEvent[] {
     return [...this.events];
   }
@@ -325,66 +445,47 @@ export class AnalyticsCollector {
     return Object.fromEntries(this.metrics.entries());
   }
 
-  getCacheMetric(): CacheMetric {
-    const total = this.cacheHits + this.cacheMisses;
-    return {
-      hits: this.cacheHits,
-      misses: this.cacheMisses,
-      hitRate: total === 0 ? 0 : this.cacheHits / total,
-    };
-  }
-
-  getBatchMetric(): BatchMetric {
-    const ops = this.batch.operations;
-    return {
-      operations: ops,
-      failures: this.batch.failures,
-      failureRate: ops === 0 ? 0 : this.batch.failures / ops,
-      totalItems: this.batch.totalItems,
-      avgDurationMs: ops === 0 ? 0 : this.batch.totalDurationMs / ops,
-      avgBatchSize: ops === 0 ? 0 : this.batch.totalItems / ops,
-      maxDurationMs: this.batch.maxDurationMs,
-    };
-  }
-
-  /**
-   * Export a standard-format performance metrics snapshot suitable for
-   * monitoring systems (Prometheus-style counters/gauges, JSON dashboards).
-   */
-  exportPerformanceMetrics(): PerformanceMetricsSnapshot {
-    const methods: Record<string, MethodMetric> = {};
-    for (const [name, rec] of this.methods.entries()) {
-      methods[name] = this.buildMethodMetric(rec);
-    }
-    return {
-      generatedAt: Date.now(),
-      uptimeMs: Date.now() - this.startTime,
-      methods,
-      cache: this.getCacheMetric(),
-      batch: this.getBatchMetric(),
-      counters: this.getMetrics(),
-    };
-  }
-
-  private buildMethodMetric(rec: MethodRecord): MethodMetric {
-    const sorted = [...rec.durations].sort((a, b) => a - b);
-    const sum = sorted.reduce((acc, v) => acc + v, 0);
-    return {
-      calls: rec.count,
-      errors: rec.errors,
-      errorRate: rec.count === 0 ? 0 : rec.errors / rec.count,
-      avgDurationMs: sorted.length === 0 ? 0 : sum / sorted.length,
-      minDurationMs: sorted.length === 0 ? 0 : sorted[0],
-      maxDurationMs: sorted.length === 0 ? 0 : sorted[sorted.length - 1],
-      p50DurationMs: this.calculatePercentile(sorted, 50),
-      p95DurationMs: this.calculatePercentile(sorted, 95),
-      p99DurationMs: this.calculatePercentile(sorted, 99),
-    };
-  }
-
   private calculatePercentile(sorted: number[], p: number): number {
     if (sorted.length === 0) return 0;
     const idx = Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length));
     return sorted[idx];
+  }
+
+  getMethodMetrics(): Record<string, MethodMetric> {
+    const out: Record<string, MethodMetric> = {};
+    for (const [method, rec] of this.methods.entries()) {
+      const sorted = [...rec.durations].sort((a, b) => a - b);
+      const total = rec.durations.reduce((sum, d) => sum + d, 0);
+      out[method] = {
+        calls: rec.count,
+        errors: rec.errors,
+        errorRate: rec.count === 0 ? 0 : rec.errors / rec.count,
+        avgDurationMs: rec.durations.length === 0 ? 0 : total / rec.durations.length,
+        minDurationMs: sorted.length === 0 ? 0 : sorted[0],
+        maxDurationMs: sorted.length === 0 ? 0 : sorted[sorted.length - 1],
+        p50DurationMs: this.calculatePercentile(sorted, 50),
+        p95DurationMs: this.calculatePercentile(sorted, 95),
+        p99DurationMs: this.calculatePercentile(sorted, 99),
+      };
+      totalMethodCalls += rec.count;
+      totalErrors += rec.errors;
+    }
+    return out;
+  }
+
+  getCategoryCounts(): Record<string, number> {
+    return Object.fromEntries(this.categoryCounts.entries());
+  }
+
+  getPeriodMs(): number {
+    return Date.now() - this.startTime;
+  }
+
+  reset(): void {
+    this.events.length = 0;
+    this.methods.clear();
+    this.metrics.clear();
+    this.categoryCounts.clear();
+    this.startTime = Date.now();
   }
 }
