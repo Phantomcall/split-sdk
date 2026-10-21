@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import fc from "fast-check";
 import { estimateSwapOutput } from "../ammCalculator.js";
 import { InsufficientLiquidityError } from "../errors.js";
 

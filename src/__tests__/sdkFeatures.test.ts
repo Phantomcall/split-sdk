@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
+import fc from "fast-check";
 import { StellarSplitClient } from "../client.js";
 import { TypedEventEmitter } from "../events/TypedEventEmitter.js";
 import { MetricsPlugin, PluginRegistry } from "../plugin.js";

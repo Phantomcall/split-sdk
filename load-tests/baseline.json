@@ -1,0 +1,57 @@
+{
+  "version": 1,
+  "description": "Performance baselines for SDK load tests. Update via `npm run load-test -- --update-baseline` after intentional performance changes.",
+  "updatedAt": "2024-01-01T00:00:00.000Z",
+  "scenarios": {
+    "invoice-split": {
+      "description": "Split a single invoice across multiple recipients",
+      "concurrency": 10,
+      "durationMs": 30000,
+      "baseline": {
+        "throughputOpsPerSec": 250,
+        "latencyMs": {
+          "p50": 35,
+          "p90": 60,
+          "p95": 80,
+          "p99": 120
+        },
+        "errorRate": 0.001
+      }
+    },
+    "batch-payments": {
+      "description": "Submit batches of payments through the SDK",
+      "concurrency": 20,
+      "durationMs": 30000,
+      "baseline": {
+        "throughputOpsPerSec": 120,
+        "latencyMs": {
+          "p50": 90,
+          "p90": 150,
+          "p95": 200,
+          "p99": 320
+        },
+        "errorRate": 0.002
+      }
+    },
+    "webhook-handling": {
+      "description": "Process inbound webhook events",
+      "concurrency": 50,
+      "durationMs": 30000,
+      "baseline": {
+        "throughputOpsPerSec": 800,
+        "latencyMs": {
+          "p50": 10,
+          "p90": 20,
+          "p95": 30,
+          "p99": 55
+        },
+        "errorRate": 0.0005
+      }
+    }
+  },
+  "regressionThresholds": {
+    "throughputDropPct": 15,
+    "latencyIncreasePct": 20,
+    "errorRateIncreasePct": 50
+  }
+}
