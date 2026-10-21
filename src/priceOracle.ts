@@ -60,27 +60,86 @@ export function parseOraclePrice(
   };
 }
 
+/**
+ * A named oracle provider backed by a fetcher. Multiple providers can be
+ * registered on a {@link PriceOracleClient} to enable aggregation and
+ * fallback.
+ */
+export interface OracleProvider {
+  /** Human-readable provider name, used for monitoring. */
+  name: string;
+  /** Fetches a raw price payload for a symbol. */
+  fetcher: OracleFetcher;
+}
+
+/** Options controlling aggregation, validation, rate limiting, and monitoring. */
+export interface PriceOracleOptions {
+  /** Minimum number of valid provider prices required to aggregate. Default: 1. */
+  minProviders?: number;
+  /** Maximum acceptable deviation (fraction, e.g. 0.1 = 10%) from the median. */
+  maxDeviation?: number;
+  /** Reject prices older than this many ms. Default: 5 minutes. */
+  maxAgeMs?: number;
+  /** Minimum interval between fetches per symbol in ms. Default: 0 (disabled). */
+  rateLimitMs?: number;
+}
+
+/** Per-provider monitoring statistics. */
+export interface OracleProviderStats {
+  name: string;
+  successes: number;
+  failures: number;
+  lastError?: string;
+  lastUpdated?: number;
+}
+
 export interface PriceOracleClientInstance {
   onPriceUpdate(listener: PriceUpdateListener): () => void;
   getCachedPrice(symbol: string): OraclePrice | undefined;
+  getProviderStats(): OracleProviderStats[];
   fetchPrice(symbol: string): Promise<OraclePrice>;
   fetchPrices(symbols: string[]): Promise<OraclePrice[]>;
 }
 
 export interface PriceOracleConstructor {
-  new (fetcher: OracleFetcher): PriceOracleClientInstance;
+  new (
+    fetcherOrProviders: OracleFetcher | OracleProvider[],
+    options?: PriceOracleOptions,
+  ): PriceOracleClientInstance;
 }
 
 /**
- * Price oracle client that fetches, parses, and emits price updates.
+ * Price oracle client that fetches, parses, aggregates, and emits price
+ * updates across one or more providers.
  */
 export class PriceOracleClient implements PriceOracleClientInstance {
-  private readonly fetcher: OracleFetcher;
+  private readonly providers: OracleProvider[];
+  private readonly options: Required<PriceOracleOptions>;
   private readonly listeners = new Set<PriceUpdateListener>();
   private readonly cache = new Map<string, OraclePrice>();
+  private readonly lastFetch = new Map<string, number>();
+  private readonly stats = new Map<string, OracleProviderStats>();
 
-  constructor(fetcher: OracleFetcher) {
-    this.fetcher = fetcher;
+  constructor(
+    fetcherOrProviders: OracleFetcher | OracleProvider[],
+    options: PriceOracleOptions = {},
+  ) {
+    this.providers = Array.isArray(fetcherOrProviders)
+      ? fetcherOrProviders
+      : [{ name: "default", fetcher: fetcherOrProviders }];
+    this.options = {
+      minProviders: options.minProviders ?? 1,
+      maxDeviation: options.maxDeviation ?? 0.1,
+      maxAgeMs: options.maxAgeMs ?? 5 * 60 * 1000,
+      rateLimitMs: options.rateLimitMs ?? 0,
+    };
+    for (const provider of this.providers) {
+      this.stats.set(provider.name, {
+        name: provider.name,
+        successes: 0,
+        failures: 0,
+      });
+    }
   }
 
   /** Subscribe to price updates. Returns an unsubscribe function. */
@@ -96,13 +155,45 @@ export class PriceOracleClient implements PriceOracleClientInstance {
     return this.cache.get(symbol);
   }
 
+  /** Return monitoring statistics for each registered provider. */
+  getProviderStats(): OracleProviderStats[] {
+    return Array.from(this.stats.values()).map((s) => ({ ...s }));
+  }
+
   /**
-   * Fetch and parse the current price for a symbol, caching the result and
-   * notifying listeners.
+   * Fetch and parse the current price for a symbol across all providers,
+   * aggregating valid results, caching the outcome, and notifying listeners.
    */
   async fetchPrice(symbol: string): Promise<OraclePrice> {
-    const raw = await this.fetcher(symbol);
-    const price = parseOraclePrice(symbol, raw);
+    const now = Date.now();
+    const last = this.lastFetch.get(symbol);
+    if (
+      this.options.rateLimitMs > 0 &&
+      last !== undefined &&
+      now - last < this.options.rateLimitMs
+    ) {
+      const cached = this.cache.get(symbol);
+      if (cached) return cached;
+    }
+    this.lastFetch.set(symbol, now);
+
+    const results = await Promise.all(
+      this.providers.map((provider) => this.fetchFromProvider(provider, symbol)),
+    );
+
+    const valid = results.filter(
+      (price): price is OraclePrice => price !== undefined,
+    );
+
+    if (valid.length < this.options.minProviders) {
+      const cached = this.cache.get(symbol);
+      if (cached) return cached;
+      throw new Error(
+        `Insufficient valid oracle prices for ${symbol} (${valid.length}/${this.options.minProviders})`,
+      );
+    }
+
+    const price = this.aggregate(symbol, valid);
     this.cache.set(symbol, price);
     this.emit(price);
     return price;
@@ -111,6 +202,60 @@ export class PriceOracleClient implements PriceOracleClientInstance {
   /** Fetch prices for multiple symbols, preserving input order. */
   async fetchPrices(symbols: string[]): Promise<OraclePrice[]> {
     return Promise.all(symbols.map((symbol) => this.fetchPrice(symbol)));
+  }
+
+  private async fetchFromProvider(
+    provider: OracleProvider,
+    symbol: string,
+  ): Promise<OraclePrice | undefined> {
+    const stats = this.stats.get(provider.name);
+    try {
+      const raw = await provider.fetcher(symbol);
+      const price = parseOraclePrice(symbol, raw);
+      if (!this.isValid(price)) {
+        throw new Error(`Price validation failed for ${symbol}`);
+      }
+      if (stats) {
+        stats.successes += 1;
+        stats.lastUpdated = price.timestamp;
+      }
+      return price;
+    } catch (error) {
+      if (stats) {
+        stats.failures += 1;
+        stats.lastError = error instanceof Error ? error.message : String(error);
+      }
+      return undefined;
+    }
+  }
+
+  /** Validate a single price: positive, finite, and not stale. */
+  private isValid(price: OraclePrice): boolean {
+    if (!Number.isFinite(price.price) || price.price <= 0) return false;
+    if (Date.now() - price.timestamp > this.options.maxAgeMs) return false;
+    return true;
+  }
+
+  /**
+   * Aggregate valid prices using the median, discarding outliers that deviate
+   * beyond `maxDeviation` from the median.
+   */
+  private aggregate(symbol: string, prices: OraclePrice[]): OraclePrice {
+    const sorted = [...prices].sort((a, b) => a.price - b.price);
+    const mid = Math.floor(sorted.length / 2);
+    const median =
+      sorted.length % 2 === 0
+        ? (sorted[mid - 1].price + sorted[mid].price) / 2
+        : sorted[mid].price;
+
+    const inliers = sorted.filter(
+      (p) => Math.abs(p.price - median) / median <= this.options.maxDeviation,
+    );
+    const chosen = inliers.length > 0 ? inliers : sorted;
+    const avg = chosen.reduce((sum, p) => sum + p.price, 0) / chosen.length;
+    const timestamp = Math.max(...chosen.map((p) => p.timestamp));
+
+    return { symbol, price: avg, timestamp };
   }
 
   private emit(price: OraclePrice): void {
@@ -241,24 +386,6 @@ export class ContractPriceOracle implements PriceOracle {
       fee: BASE_FEE,
       networkPassphrase: this.networkPassphrase,
     })
-      .addOperation(operation)
-      .setTimeout(30)
-      .build();
+   
 
-    const simResult = await this.server.simulateTransaction(tx);
-    if (SorobanRpc.Api.isSimulationError(simResult)) {
-      if (/no price|not found|unsupported/i.test(simResult.error)) {
-        return undefined;
-      }
-      throw new OraclePriceError(`Oracle simulation failed: ${simResult.error}`);
-    }
-
-    const returnVal = (simResult as SorobanRpc.Api.SimulateTransactionSuccessResponse).result
-      ?.retval;
-    if (!returnVal) throw new NoReturnValueError("oracle get_price");
-
-    return BigInt(scValToNative(returnVal));
-  }
-}
-
-
+/* … truncated 613 chars — edit only what you need near the top … */

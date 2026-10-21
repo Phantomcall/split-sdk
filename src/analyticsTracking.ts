@@ -9,6 +9,146 @@ import { createHash, randomBytes } from "crypto";
 
 export type PrivacyLevel = "strict" | "anonymized" | "standard";
 
+// ---------------------------------------------------------------------------
+// Debug Mode
+// ---------------------------------------------------------------------------
+
+export type DebugLevel = "off" | "error" | "warn" | "info" | "debug" | "trace";
+
+const DEBUG_LEVEL_ORDER: Record<DebugLevel, number> = {
+  off: 0,
+  error: 1,
+  warn: 2,
+  info: 3,
+  debug: 4,
+  trace: 5,
+};
+
+export interface DebugConfig {
+  /** Active debug level threshold. Default: "off". */
+  level?: DebugLevel;
+  /** Sink for formatted debug lines. Default: console. */
+  logger?: (line: string) => void;
+  /** Named breakpoints that should pause/flag execution. */
+  breakpoints?: string[];
+  /** Callback invoked when a breakpoint is hit. */
+  onBreakpoint?: (name: string, context?: Record<string, unknown>) => void;
+}
+
+/**
+ * Debug utilities: level gating, verbose logging, breakpoints, and state inspection.
+ */
+export class DebugController {
+  private level: DebugLevel;
+  private readonly logger: (line: string) => void;
+  private readonly breakpoints = new Set<string>();
+  private readonly onBreakpoint?: (name: string, context?: Record<string, unknown>) => void;
+  private readonly hits = new Map<string, number>();
+
+  constructor(config?: DebugConfig) {
+    this.level = config?.level ?? "off";
+    this.logger = config?.logger ?? ((line) => console.log(line));
+    this.onBreakpoint = config?.onBreakpoint;
+    for (const bp of config?.breakpoints ?? []) {
+      this.breakpoints.add(bp);
+    }
+  }
+
+  get currentLevel(): DebugLevel {
+    return this.level;
+  }
+
+  setLevel(level: DebugLevel): void {
+    this.level = level;
+  }
+
+  enable(level: DebugLevel = "debug"): void {
+    this.level = level;
+  }
+
+  disable(): void {
+    this.level = "off";
+  }
+
+  isEnabled(level: DebugLevel = "debug"): boolean {
+    return DEBUG_LEVEL_ORDER[this.level] >= DEBUG_LEVEL_ORDER[level];
+  }
+
+  /** Emit a verbose log line gated by the active debug level. */
+  log(level: Exclude<DebugLevel, "off">, message: string, context?: Record<string, unknown>): void {
+    if (!this.isEnabled(level)) return;
+    const ts = new Date().toISOString();
+    const suffix = context ? ` ${this.format(context)}` : "";
+    this.logger(`[${ts}] [${level.toUpperCase()}] ${message}${suffix}`);
+  }
+
+  error(message: string, context?: Record<string, unknown>): void {
+    this.log("error", message, context);
+  }
+
+  warn(message: string, context?: Record<string, unknown>): void {
+    this.log("warn", message, context);
+  }
+
+  info(message: string, context?: Record<string, unknown>): void {
+    this.log("info", message, context);
+  }
+
+  debug(message: string, context?: Record<string, unknown>): void {
+    this.log("debug", message, context);
+  }
+
+  trace(message: string, context?: Record<string, unknown>): void {
+    this.log("trace", message, context);
+  }
+
+  addBreakpoint(name: string): void {
+    this.breakpoints.add(name);
+  }
+
+  removeBreakpoint(name: string): void {
+    this.breakpoints.delete(name);
+  }
+
+  /**
+   * Flag execution at a named breakpoint when debug mode is enabled.
+   * Returns true when the breakpoint is active and was hit.
+   */
+  breakpoint(name: string, context?: Record<string, unknown>): boolean {
+    if (!this.isEnabled("debug") || !this.breakpoints.has(name)) return false;
+    this.hits.set(name, (this.hits.get(name) ?? 0) + 1);
+    this.log("debug", `breakpoint hit: ${name}`, context);
+    this.onBreakpoint?.(name, context);
+    return true;
+  }
+
+  getBreakpointHits(): Record<string, number> {
+    return Object.fromEntries(this.hits.entries());
+  }
+
+  /** Format a value for debug output (safe against circular references). */
+  format(value: unknown): string {
+    const seen = new WeakSet<object>();
+    try {
+      return JSON.stringify(value, (_key, val) => {
+        if (typeof val === "object" && val !== null) {
+          if (seen.has(val as object)) return "[Circular]";
+          seen.add(val as object);
+        }
+        if (typeof val === "bigint") return val.toString();
+        return val;
+      });
+    } catch {
+      return String(value);
+    }
+  }
+
+  /** Inspect arbitrary state for debugging. */
+  inspect(label: string, state: unknown): void {
+    this.log("debug", `inspect ${label}`, { state });
+  }
+}
+
 export interface AnalyticsPrivacyConfig {
   /**
    * Overall privacy level:
@@ -82,195 +222,8 @@ export interface AnalyticsTrackerOptions {
   onReport?: (report: AnalyticsReport) => void;
   /** Optional custom fetch implementation for network reporting. */
   fetchFn?: typeof fetch;
-  /** Distributed tracing configuration. */
-  tracing?: TracingConfig;
-}
-
-// ---------------------------------------------------------------------------
-// Distributed Tracing
-// ---------------------------------------------------------------------------
-
-/**
- * W3C Trace Context compatible identifiers. A trace is a tree of spans sharing
- * the same traceId; each span has its own spanId and an optional parentSpanId.
- */
-export interface TraceContext {
-  traceId: string;
-  spanId: string;
-  parentSpanId?: string;
-  sampled: boolean;
-}
-
-export interface Span {
-  traceId: string;
-  spanId: string;
-  parentSpanId?: string;
-  name: string;
-  startTime: number;
-  endTime?: number;
-  durationMs?: number;
-  attributes: Record<string, unknown>;
-  status: "ok" | "error";
-  error?: string;
-}
-
-export interface TracingConfig {
-  /** Enable tracing. Default: false (opt-in, consistent with analytics). */
-  enabled?: boolean;
-  /** Sampling ratio in [0, 1]. Default: 1 (sample everything). */
-  sampleRate?: number;
-  /** Service name attached to exported spans. */
-  serviceName?: string;
-  /** Maximum number of finished spans retained before export. Default: 1000. */
-  maxSpans?: number;
-  /** Custom span exporter invoked on flush. */
-  exporter?: (spans: Span[]) => void;
-}
-
-const TRACEPARENT_PATTERN = /^([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{16})-([0-9a-f]{2})$/;
-
-function randomHex(bytes: number): string {
-  return randomBytes(bytes).toString("hex");
-}
-
-/**
- * Lightweight W3C Trace Context implementation: sampling, span creation,
- * propagation via the `traceparent` header, and buffered export.
- */
-export class Tracer {
-  private readonly enabled: boolean;
-  private readonly sampleRate: number;
-  private readonly serviceName: string;
-  private readonly maxSpans: number;
-  private readonly exporter?: (spans: Span[]) => void;
-  private readonly spans: Span[] = [];
-
-  constructor(config?: TracingConfig) {
-    this.enabled = config?.enabled ?? false;
-    this.sampleRate = Math.min(1, Math.max(0, config?.sampleRate ?? 1));
-    this.serviceName = config?.serviceName ?? "stellar-sdk";
-    this.maxSpans = config?.maxSpans ?? 1000;
-    this.exporter = config?.exporter;
-  }
-
-  get isEnabled(): boolean {
-    return this.enabled;
-  }
-
-  /** Decide whether a new trace should be sampled. */
-  shouldSample(): boolean {
-    if (!this.enabled) return false;
-    if (this.sampleRate >= 1) return true;
-    if (this.sampleRate <= 0) return false;
-    return Math.random() < this.sampleRate;
-  }
-
-  /** Start a new root trace context. */
-  startTrace(): TraceContext {
-    return {
-      traceId: randomHex(16),
-      spanId: randomHex(8),
-      sampled: this.shouldSample(),
-    };
-  }
-
-  /** Parse an incoming `traceparent` header into a TraceContext. */
-  extractTraceContext(headers: Record<string, string | undefined>): TraceContext | undefined {
-    const raw = headers["traceparent"] ?? headers["Traceparent"];
-    if (!raw) return undefined;
-    const match = TRACEPARENT_PATTERN.exec(raw.trim().toLowerCase());
-    if (!match) return undefined;
-    const [, traceId, parentSpanId, , flags] = match;
-    if (traceId === "0".repeat(32) || parentSpanId === "0".repeat(16)) return undefined;
-    return {
-      traceId,
-      spanId: randomHex(8),
-      parentSpanId,
-      sampled: (parseInt(flags, 16) & 0x01) === 0x01,
-    };
-  }
-
-  /** Serialize a TraceContext into a `traceparent` header value. */
-  injectTraceContext(context: TraceContext): Record<string, string> {
-    const flags = context.sampled ? "01" : "00";
-    return {
-      traceparent: `${context.traceId}-${context.spanId}-${flags}`,
-    };
-  }
-
-  /** Create a child span context from a parent context. */
-  childContext(parent: TraceContext): TraceContext {
-    return {
-      traceId: parent.traceId,
-      spanId: randomHex(8),
-      parentSpanId: parent.spanId,
-      sampled: parent.sampled,
-    };
-  }
-
-  /** Begin a span for a tracked operation. */
-  startSpan(name: string, context?: TraceContext, attributes?: Record<string, unknown>): Span {
-    const ctx = context ?? this.startTrace();
-    return {
-      traceId: ctx.traceId,
-      spanId: ctx.spanId,
-      parentSpanId: ctx.parentSpanId,
-      name,
-      startTime: Date.now(),
-      attributes: { "service.name": this.serviceName, ...(attributes ?? {}) },
-      status: "ok",
-    };
-  }
-
-  /** Finish a span, recording duration/status and buffering it for export. */
-  endSpan(span: Span, error?: unknown): Span {
-    span.endTime = Date.now();
-    span.durationMs = span.endTime - span.startTime;
-    if (error !== undefined) {
-      span.status = "error";
-      span.error = error instanceof Error ? error.message : String(error);
-    }
-    if (span.traceId && this.enabled) {
-      if (this.spans.length >= this.maxSpans) {
-        this.spans.shift();
-      }
-      this.spans.push(span);
-    }
-    return span;
-  }
-
-  /** Convenience wrapper: run fn inside a span, ending it on completion. */
-  async withSpan<T>(
-    name: string,
-    fn: (context: TraceContext) => Promise<T> | T,
-    context?: TraceContext,
-    attributes?: Record<string, unknown>,
-  ): Promise<T> {
-    const ctx = context ?? this.startTrace();
-    const span = this.startSpan(name, ctx, attributes);
-    try {
-      const result = await fn(ctx);
-      this.endSpan(span);
-      return result;
-    } catch (err) {
-      this.endSpan(span, err);
-      throw err;
-    }
-  }
-
-  /** Export buffered spans via the configured exporter and clear the buffer. */
-  flush(): Span[] {
-    const batch = this.spans.splice(0, this.spans.length);
-    if (batch.length > 0 && this.exporter) {
-      this.exporter(batch);
-    }
-    return batch;
-  }
-
-  /** Return a copy of currently buffered spans (for visualization). */
-  getSpans(): Span[] {
-    return [...this.spans];
-  }
+  /** Debug mode configuration for verbose operation logging. */
+  debug?: DebugConfig;
 }
 
 // ---------------------------------------------------------------------------
@@ -456,22 +409,18 @@ export class AnalyticsCollector {
     return sorted[idx];
   }
 
-  generateReport(privacy: PrivacyController): AnalyticsReport {
-    const now = Date.now();
-    const methods: Record<string, MethodMetric> = {};
-    let totalMethodCalls = 0;
-    let totalErrors = 0;
-
-    for (const [name, rec] of this.methods.entries()) {
+  getMethodMetrics(): Record<string, MethodMetric> {
+    const out: Record<string, MethodMetric> = {};
+    for (const [method, rec] of this.methods.entries()) {
       const sorted = [...rec.durations].sort((a, b) => a - b);
-      const sum = sorted.reduce((acc, d) => acc + d, 0);
-      methods[name] = {
+      const total = rec.durations.reduce((sum, d) => sum + d, 0);
+      out[method] = {
         calls: rec.count,
         errors: rec.errors,
-        errorRate: rec.count > 0 ? rec.errors / rec.count : 0,
-        avgDurationMs: sorted.length > 0 ? sum / sorted.length : 0,
-        minDurationMs: sorted.length > 0 ? sorted[0] : 0,
-        maxDurationMs: sorted.length > 0 ? sorted[sorted.length - 1] : 0,
+        errorRate: rec.count === 0 ? 0 : rec.errors / rec.count,
+        avgDurationMs: rec.durations.length === 0 ? 0 : total / rec.durations.length,
+        minDurationMs: sorted.length === 0 ? 0 : sorted[0],
+        maxDurationMs: sorted.length === 0 ? 0 : sorted[sorted.length - 1],
         p50DurationMs: this.calculatePercentile(sorted, 50),
         p95DurationMs: this.calculatePercentile(sorted, 95),
         p99DurationMs: this.calculatePercentile(sorted, 99),
@@ -479,22 +428,22 @@ export class AnalyticsCollector {
       totalMethodCalls += rec.count;
       totalErrors += rec.errors;
     }
+    return out;
+  }
 
-    return {
-      generatedAt: now,
-      periodMs: now - this.startTime,
-      privacyLevel: privacy.level,
-      totalEvents: this.events.length,
-      totalMethodCalls,
-      totalErrors,
-      overallErrorRate: totalMethodCalls > 0 ? totalErrors / totalMethodCalls : 0,
-      methods,
-      eventsByCategory: Object.fromEntries(this.categoryCounts.entries()),
-      metrics: this.getMetrics(),
-      events: this.events.map((e) => ({
-        ...e,
-        properties: privacy.sanitizeProperties(e.properties),
-      })),
-    };
+  getCategoryCounts(): Record<string, number> {
+    return Object.fromEntries(this.categoryCounts.entries());
+  }
+
+  getPeriodMs(): number {
+    return Date.now() - this.startTime;
+  }
+
+  reset(): void {
+    this.events.length = 0;
+    this.methods.clear();
+    this.metrics.clear();
+    this.categoryCounts.clear();
+    this.startTime = Date.now();
   }
 }
