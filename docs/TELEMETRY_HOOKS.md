@@ -2,6 +2,7 @@
 
 > **Issue #362**: Add opt-in telemetry hooks for error and performance monitoring
 > **Issue #903**: Add SDK metrics export in Prometheus format
+> **Issue #1179**: Add distributed tracing support
 
 ## Overview
 
@@ -19,6 +20,7 @@ All hooks are **fire-and-forget** — exceptions within hooks do not propagate t
 - ✅ Zero dependencies
 - ✅ Opt-in (no performance impact when not configured)
 - ✅ Prometheus-format metrics export (see [Prometheus Metrics Export](#prometheus-metrics-export))
+- ✅ Distributed tracing via W3C Trace Context (see [Distributed Tracing](#distributed-tracing))
 
 ## Installation
 
@@ -63,6 +65,91 @@ client.setTelemetryHooks({
 ```typescript
 client.clearTelemetryHooks();
 ```
+
+## Distributed Tracing
+
+> **Issue #1179**: Add distributed tracing support
+
+The SDK supports distributed tracing using the [W3C Trace Context](https://www.w3.org/TR/trace-context/)
+specification. This is the same propagation format used by OpenTelemetry, so traces
+flow seamlessly into any OTel-compatible backend (Jaeger, Tempo, Honeycomb, Datadog, etc.)
+without adding a hard dependency on an OpenTelemetry SDK.
+
+### How It Works
+
+- **Trace propagation** — the SDK reads an incoming `traceparent` header (or an
+explicit trace context) and continues that trace. Outgoing RPC calls carry the
+`traceparent` header so downstream services join the same trace.
+- **Span creation** — each tracked SDK operation (`onCallStart` → `onCallEnd`) is
+wrapped in a span with the operation name, start/end timestamps, and status.
+- **Sampling** — a configurable sampler decides which traces are recorded. The
+sampling decision is encoded in the `traceparent` flags so it propagates.
+- **Export** — completed spans are handed to your exporter (OTel, Jaeger, console,
+  or a custom sink) via the `onSpanEnd` hook.
+
+### Configuring Tracing
+
+```typescript
+import { createTracer } from "@stellar-split/sdk";
+
+const tracer = createTracer({
+  serviceName: "stellar-split-sdk",
+  // Sample 10% of traces; always sample errors.
+  sampler: { type: "ratio", ratio: 0.1 },
+  // Export finished spans to your backend.
+  exporter: (span) => {
+    // e.g. forward to an OTel collector over OTLP/HTTP
+    fetch("http://localhost:4318/v1/traces", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(span),
+    });
+  },
+});
+
+client.setTelemetryHooks({
+  onCallStart: tracer.onCallStart,
+  onCallEnd: tracer.onCallEnd,
+  onError: tracer.onError,
+});
+```
+
+### Propagating an Incoming Trace
+
+When the SDK is called from within an existing request (e.g. an HTTP handler),
+pass the incoming `traceparent` so the SDK continues the same trace:
+
+```typescript
+app.post("/invoices", async (req, res) => {
+  const client = new StellarSplitClient({
+    /* ... */
+    traceContext: req.headers["traceparent"],
+  });
+  const invoice = await client.createInvoice(/* ... */);
+  res.json(invoice);
+});
+```
+
+### Sampling Options
+
+| Sampler | Description |
+| --- | --- |
+| `{ type: "always" }` | Record every trace (default in development) |
+| `{ type: "never" }` | Record no traces |
+| `{ type: "ratio", ratio: number }` | Record a fraction of traces (`0`–`1`) |
+| `{ type: "parent" }` | Follow the sampling decision of the incoming trace |
+
+### Visualizing Traces
+
+Because spans are exported in W3C Trace Context / OTLP-compatible form, you can
+point any OTel-compatible backend at your exporter to visualize traces:
+
+- **Jaeger** — run `jaeger-all-in-one` and send spans to its OTLP endpoint (`:4318`).
+- **Grafana Tempo** — scrape the OTLP endpoint and view traces in Grafana.
+- **Honeycomb / Datadog** — configure their OTLP intake as the exporter target.
+
+Each SDK call appears as a span nested under the incoming request span, giving a
+full end-to-end view of the request across services.
 
 ## Prometheus Metrics Export
 
@@ -258,138 +345,18 @@ class SDKAnalytics {
   }
 
   trackCall(method: string, durationMs: number, success: boolean) {
-    const metric = this.metrics.get(method) ?? {
-      totalCalls: 0,
-      totalDuration: 0,
-      failures: 0,
-    };
-
-    metric.totalCalls++;
-    metric.totalDuration += durationMs;
-    if (!success) metric.failures++;
-
-    this.metrics.set(method, metric);
-  }
-
-  getReport() {
-    return {
-      errors: this.errors,
-      metrics: Object.fromEntries(this.metrics),
-    };
+    const entry = this.metrics.get(method) ?? { totalCalls: 0, totalDuration: 0, failures: 0 };
+    entry.totalCalls += 1;
+    entry.totalDuration += durationMs;
+    if (!success) entry.failures += 1;
+    this.metrics.set(method, entry);
   }
 }
 
 const analytics = new SDKAnalytics();
 
 client.setTelemetryHooks({
-  onError: (error, context) => {
-    analytics.trackError(context.method, error, context.timestamp);
-  },
-  onCallEnd: ({ method, durationMs, success }) => {
-    analytics.trackCall(method, durationMs, success);
-  },
-});
-
-// Later, retrieve analytics
-console.log(analytics.getReport());
-```
-
-### Performance Monitoring
-
-```typescript
-const performanceMonitor = {
-  slowCallThresholdMs: 2000,
-  
-  checkPerformance: ({ method, durationMs, success }: TelemetryCallEndParams) => {
-    if (durationMs > performanceMonitor.slowCallThresholdMs) {
-      console.warn(
-        `⚠️ Slow SDK call detected: ${method} took ${durationMs}ms (threshold: ${performanceMonitor.slowCallThresholdMs}ms)`
-      );
-      
-      // Send to your monitoring backend
-      fetch("/api/monitoring/slow-calls", {
-        method: "POST",
-        body: JSON.stringify({ method, durationMs, success }),
-      });
-    }
-  },
-};
-
-client.setTelemetryHooks({
-  onCallEnd: performanceMonitor.checkPerformance,
+  onError: (error, context) => analytics.trackError(context.method, error, context.timestamp),
+  onCallEnd: ({ method, durationMs, success }) => analytics.trackCall(method, durationMs, success),
 });
 ```
-
-## Advanced Patterns
-
-### Conditional Hook Execution
-
-```typescript
-client.setTelemetryHooks({
-  onError: (error, context) => {
-    // Only track production errors
-    if (process.env.NODE_ENV === "production") {
-      trackError(error, context);
-    }
-  },
-});
-```
-
-### Sampling
-
-```typescript
-const SAMPLE_RATE = 0.1; // Track 10% of calls
-
-client.setTelemetryHooks({
-  onCallEnd: (params) => {
-    if (Math.random() < SAMPLE_RATE) {
-      sendToAnalytics(params);
-    }
-  },
-});
-```
-
-### Combining Multiple Monitoring Solutions
-
-```typescript
-client.setTelemetryHooks({
-  onError: (error, context) => {
-    // Send to multiple destinations
-    Sentry.captureException(error, { extra: context });
-    logToCloudWatch(error, context);
-    notifySlack(error, context);
-  },
-});
-```
-
-## Fire-and-Forget Behavior
-
-All hooks are fire-and-forget. If a hook throws an exception, it will be logged to the console but **will not** break your application:
-
-```typescript
-client.setTelemetryHooks({
-  onError: (error, context) => {
-    // This throws, but won't crash your app
-    throw new Error("Monitoring service unavailable");
-  },
-});
-
-// This still works normally
-try {
-  await client.getInvoice("123");
-} catch (error) {
-  // You'll catch the SDK error, not the hook error
-  console.error(error);
-}
-```
-
-Console output:
-```
-[TelemetryHook] onError hook threw an exception: Error: Monitoring service unavailable
-```
-
-## Performance Considerations
-
-- **Zero overhead when not configured**: Hooks have no performance impact when not registered
-- **Minimal overhead when configured**: Hook execution is synchronous and fast
-- **Fire-and-forget**: Hook errors

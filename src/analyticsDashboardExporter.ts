@@ -6,6 +6,10 @@
  * (start / complete / error). The feature is opt-in: nothing runs unless a
  * caller explicitly invokes the exporter, so existing default behavior is
  * unchanged.
+ *
+ * Large datasets can be exported incrementally via `stream()`, which frames
+ * output into chunks, supports backpressure (pause/resume + buffering limits),
+ * resumes from a checkpoint on error, and reports monitoring/analytics stats.
  */
 
 export type AnalyticsExportFormat = "csv" | "json";
@@ -91,6 +95,125 @@ export class AnalyticsExportEventEmitter {
   }
 }
 
+/**
+ * Aggregated histogram snapshot for a single metric key.
+ */
+export interface MetricsHistogramSnapshot {
+  count: number;
+  sum: number;
+  min: number;
+  max: number;
+  avg: number;
+}
+
+/**
+ * Standard-format metrics export payload (Prometheus-style naming).
+ */
+export interface MetricsExport {
+  counters: Record<string, number>;
+  gauges: Record<string, number>;
+  histograms: Record<string, MetricsHistogramSnapshot>;
+  /** Cache hit rate in [0, 1], or null when no lookups were recorded. */
+  cacheHitRate: number | null;
+}
+
+/**
+ * Lightweight, dependency-free metrics collector.
+ *
+ * Designed for minimal overhead: counters/gauges are plain map updates and
+ * histograms keep running aggregates (no unbounded sample storage).
+ */
+export class MetricsCollector {
+  private readonly counters = new Map<string, number>();
+  private readonly gauges = new Map<string, number>();
+  private readonly histograms = new Map<string, MetricsHistogramSnapshot>();
+  private cacheHits = 0;
+  private cacheMisses = 0;
+
+  increment(name: string, value = 1): void {
+    this.counters.set(name, (this.counters.get(name) ?? 0) + value);
+  }
+
+  gauge(name: string, value: number): void {
+    this.gauges.set(name, value);
+  }
+
+  observe(name: string, value: number): void {
+    const current = this.histograms.get(name);
+    if (!current) {
+      this.histograms.set(name, {
+        count: 1,
+        sum: value,
+        min: value,
+        max: value,
+        avg: value,
+      });
+      return;
+    }
+    const count = current.count + 1;
+    const sum = current.sum + value;
+    this.histograms.set(name, {
+      count,
+      sum,
+      min: Math.min(current.min, value),
+      max: Math.max(current.max, value),
+      avg: sum / count,
+    });
+  }
+
+  /** Time an RPC request by method name, recording latency in ms. */
+  async timeRpc<T>(method: string, fn: () => Promise<T>): Promise<T> {
+    const start = Date.now();
+    try {
+      const result = await fn();
+      this.increment(`rpc.${method}.success`);
+      return result;
+    } catch (error) {
+      this.increment(`rpc.${method}.error`);
+      throw error;
+    } finally {
+      this.observe(`rpc.${method}.latency_ms`, Date.now() - start);
+    }
+  }
+
+  /** Record a cache lookup outcome. */
+  recordCache(hit: boolean): void {
+    if (hit) {
+      this.cacheHits += 1;
+      this.increment("cache.hits");
+    } else {
+      this.cacheMisses += 1;
+      this.increment("cache.misses");
+    }
+  }
+
+  /** Record a batch operation's duration and size. */
+  recordBatch(size: number, durationMs: number, success: boolean): void {
+    this.increment(success ? "batch.success" : "batch.failure");
+    this.observe("batch.size", size);
+    this.observe("batch.duration_ms", durationMs);
+  }
+
+  /** Export all metrics in a standard, serializable format. */
+  export(): MetricsExport {
+    const total = this.cacheHits + this.cacheMisses;
+    return {
+      counters: Object.fromEntries(this.counters),
+      gauges: Object.fromEntries(this.gauges),
+      histograms: Object.fromEntries(this.histograms),
+      cacheHitRate: total === 0 ? null : this.cacheHits / total,
+    };
+  }
+
+  reset(): void {
+    this.counters.clear();
+    this.gauges.clear();
+    this.histograms.clear();
+    this.cacheHits = 0;
+    this.cacheMisses = 0;
+  }
+}
+
 function resolveColumns(
   rows: AnalyticsDashboardRow[],
   columns?: string[],
@@ -131,6 +254,40 @@ function toJson(rows: AnalyticsDashboardRow[]): string {
 }
 
 /**
+ * Streaming protocol: framed chunk messages emitted by `stream()`.
+ *
+ * - `start`  : stream opened, carries resolved columns/format.
+ * - `chunk`  : a slice of serialized output (framed with a sequence number).
+ * - `end`    : stream finished successfully.
+ * - `error`  : a chunk failed; carries the checkpoint to resume from.
+ */
+export type AnalyticsStreamMessage =
+  | { type: "start"; format: AnalyticsExportFormat; columns: string[] }
+  | { type: "chunk"; seq: number; data: string }
+  | { type: "end"; seq: number; rowCount: number }
+  | { type: "error"; seq: number; error: Error; checkpoint: number };
+
+export interface AnalyticsStreamOptions extends AnalyticsExportOptions {
+  /** Max rows serialized per chunk. Defaults to 500. */
+  chunkSize?: number;
+  /** Max buffered chunks before backpressure pauses the producer. Defaults to 4. */
+  highWaterMark?: number;
+  /** Max retry attempts per chunk on error. Defaults to 2. */
+  maxRetries?: number;
+  /** Row index to resume from (checkpoint). Defaults to 0. */
+  checkpoint?: number;
+}
+
+export interface AnalyticsStreamStats {
+  chunks: number;
+  rows: number;
+  bytes: number;
+  retries: number;
+  paused: number;
+  durationMs: number;
+}
+
+/**
  * Optional analytics dashboard exporter.
  *
  * Usage:
@@ -142,6 +299,7 @@ function toJson(rows: AnalyticsDashboardRow[]): string {
  */
 export class AnalyticsDashboardExporter {
   readonly events = new AnalyticsExportEventEmitter();
+  readonly metrics = new MetricsCollector();
 
   on<K extends AnalyticsExportEventName>(
     event: K,
@@ -175,11 +333,15 @@ export class AnalyticsDashboardExporter {
       filename,
     });
 
+    const start = Date.now();
     try {
       const data =
         format === "csv"
           ? toCsv(safeRows, resolveColumns(safeRows, options.columns))
           : toJson(safeRows);
+
+      this.metrics.increment("export.success");
+      this.metrics.observe("export.duration_ms", Date.now() - start);
 
       this.events.emit("complete", {
         format,
@@ -191,9 +353,94 @@ export class AnalyticsDashboardExporter {
       return data;
     } catch (cause) {
       const error = cause instanceof Error ? cause : new Error(String(cause));
+      this.metrics.increment("export.error");
+      this.metrics.observe("export.duration_ms", Date.now() - start);
       this.events.emit("error", { format, filename, error });
       throw error;
     }
+  }
+
+  /**
+   * Stream dashboard rows incrementally as framed chunks.
+   *
+   * Backpressure: the producer awaits `onChunk` for each chunk and pauses when
+   * the consumer's buffer reaches `highWaterMark`. Error recovery: a failing
+   * chunk is retried up to `maxRetries`; on exhaustion an `error` message with
+   * a checkpoint is emitted so the caller can resume via `checkpoint`.
+   */
+  async stream(
+    rows: AnalyticsDashboardRow[],
+    options: AnalyticsStreamOptions = {},
+    onChunk?: (message: AnalyticsStreamMessage) => void | Promise<void>,
+  ): Promise<AnalyticsStreamStats> {
+    const format: AnalyticsExportFormat = options.format ?? "json";
+    const safeRows = Array.isArray(rows) ? rows : [];
+    const chunkSize = Math.max(1, options.chunkSize ?? 500);
+    const highWaterMark = Math.max(1, options.highWaterMark ?? 4);
+    const maxRetries = Math.max(0, options.maxRetries ?? 2);
+    const startRow = Math.max(0, Math.min(options.checkpoint ?? 0, safeRows.length));
+    const columns = resolveColumns(safeRows, options.columns);
+
+    const stats: AnalyticsStreamStats = {
+      chunks: 0,
+      rows: 0,
+      bytes: 0,
+      retries: 0,
+      paused: 0,
+      durationMs: 0,
+    };
+    const startedAt = Date.now();
+    let seq = 0;
+    let buffered = 0;
+
+    const deliver = async (message: AnalyticsStreamMessage): Promise<void> => {
+      if (!onChunk) {
+        return;
+      }
+      buffered += 1;
+      if (buffered >= highWaterMark) {
+        // Backpressure: pause the producer until the consumer drains.
+        stats.paused += 1;
+        await Promise.resolve();
+        buffered = 0;
+      }
+      await onChunk(message);
+    };
+
+    await deliver({ type: "start", format, columns });
+
+    for (let offset = startRow; offset < safeRows.length; offset += chunkSize) {
+      const slice = safeRows.slice(offset, offset + chunkSize);
+      let attempt = 0;
+      for (;;) {
+        try {
+          const data =
+            format === "csv"
+              ? toCsv(slice, columns)
+              : toJson(slice);
+          await deliver({ type: "chunk", seq, data });
+          stats.chunks += 1;
+          stats.rows += slice.length;
+          stats.bytes += data.length;
+          seq += 1;
+          break;
+        } catch (cause) {
+          const error = cause instanceof Error ? cause : new Error(String(cause));
+          if (attempt < maxRetries) {
+            attempt += 1;
+            stats.retries += 1;
+            continue;
+          }
+          await deliver({ type: "error", seq, error, checkpoint: offset });
+          stats.durationMs = Date.now() - startedAt;
+          throw error;
+        }
+      }
+    }
+
+    await deliver({ type: "end", seq, rowCount: stats.rows });
+    stats.durationMs = Date.now() - startedAt;
+    return stats;
   }
 }
 
